@@ -48,7 +48,7 @@ def fetch_projects():
     try:
         uid, models = get_odoo_connection()
         projects = odoo_call(models, uid, "project.project", "search_read",
-            [[[("active", "=", True)]]],
+            [[("active", "=", True)]],
             {"fields": ["id", "name"], "order": "name asc", "limit": 200})
         return {p["name"]: p["id"] for p in projects}, None
     except Exception as e:
@@ -62,13 +62,13 @@ def fetch_project_attachments(project_id):
 
         # Find tasks in this project that have SWR Cutlist in the name
         tasks = odoo_call(models, uid, "project.task", "search_read",
-            [[[("project_id", "=", project_id), ("name", "ilike", "SWR")]]],
+            [[("project_id", "=", project_id), ("name", "ilike", "SWR")]],
             {"fields": ["id", "name", "create_date"], "order": "create_date desc", "limit": 10})
 
         if not tasks:
             # Fall back to any task in the project
             tasks = odoo_call(models, uid, "project.task", "search_read",
-                [[[("project_id", "=", project_id)]]],
+                [[("project_id", "=", project_id)]],
                 {"fields": ["id", "name", "create_date"], "order": "create_date desc", "limit": 20})
 
         if not tasks:
@@ -77,8 +77,8 @@ def fetch_project_attachments(project_id):
         # Get attachments from all found tasks
         task_ids = [t["id"] for t in tasks]
         attachments = odoo_call(models, uid, "ir.attachment", "search_read",
-            [[[("res_model", "=", "project.task"), ("res_id", "in", task_ids),
-               ("name", "ilike", ".xlsx")]]],
+            [[("res_model", "=", "project.task"), ("res_id", "in", task_ids),
+               ("name", "ilike", ".xlsx")]],
             {"fields": ["id", "name", "res_id", "datas", "create_date"],
              "order": "create_date desc"})
 
@@ -96,13 +96,13 @@ def fetch_vendors():
     try:
         uid, models = get_odoo_connection()
         vendors = odoo_call(models, uid, "res.partner", "search_read",
-            [[[("supplier_rank", ">", 0)]]],
+            [[("supplier_rank", ">", 0)]],
             {"fields": ["id", "name", "email", "phone", "street", "street2",
                         "city", "state_id", "zip", "country_id", "child_ids"],
              "order": "name asc", "limit": 200})
         if not vendors:
             vendors = odoo_call(models, uid, "res.partner", "search_read",
-                [[[("is_company", "=", True)]]],
+                [[("is_company", "=", True)]],
                 {"fields": ["id", "name", "email", "phone", "street", "street2",
                             "city", "state_id", "zip", "country_id", "child_ids"],
                  "order": "name asc", "limit": 200})
@@ -389,10 +389,10 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
 
     # Find product
     product_name = "SWR Glass Panel" if po_type == "Glass" else "SWR Aluminium Extrusion"
-    product_ids = oc("product.product", "search", [[[("name", "ilike", product_name)]]])
+    product_ids = oc("product.product", "search", [[("name", "ilike", product_name)]])
     if not product_ids:
         # Use any product as fallback
-        product_ids = oc("product.product", "search", [[[("active", "=", True)]]], {"limit": 1})
+        product_ids = oc("product.product", "search", [[("active", "=", True)]], {"limit": 1})
     if not product_ids:
         raise Exception(f"No product found. Please create a product named '{product_name}' in Odoo.")
 
