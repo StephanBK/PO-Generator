@@ -131,9 +131,17 @@ def fetch_vendors():
 def parse_glass_file(file_bytes):
     """Parse SWR_Glass xlsx — returns list of glass line items."""
     try:
-        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Glass")
+        # Glass file has header info in first 12 rows, data starts at row 12 (0-indexed)
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Glass", header=12)
+        # If Tag column not found, try finding it dynamically
+        if "Tag" not in df.columns:
+            raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Glass", header=None)
+            for i, row in raw.iterrows():
+                if "Tag" in str(row.values):
+                    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Glass", header=i)
+                    break
         # Drop totals row
-        df = df[df["Tag"].astype(str) != "Totals"].copy()
+        df = df[df["Tag"].astype(str).str.strip() != "Totals"].copy()
         df = df.dropna(subset=["Tag"])
         lines = []
         for _, row in df.iterrows():
