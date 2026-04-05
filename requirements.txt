@@ -1,0 +1,6 @@
+streamlit==1.40.0
+pandas==2.2.2
+python-docx==1.1.2
+xmlrpc-client-compat
+openpyxl==3.1.5
+requests==2.32.3
