@@ -199,6 +199,251 @@ def parse_aggcutonly_file(file_bytes):
     except Exception as e:
         return [], str(e)
 
+def parse_optimizer_file(file_bytes):
+    """Parse cutting_list optimizer Excel — returns line items grouped by (Part Number, Stock Length)."""
+    try:
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None)
+
+        # Find the DETAILED CUT LIST header row
+        detail_row = None
+        for i, row in df.iterrows():
+            if str(row.iloc[0]).strip() == "DETAILED CUT LIST":
+                detail_row = i
+                break
+        if detail_row is None:
+            return [], "Could not find 'DETAILED CUT LIST' section in optimizer file."
+
+        # The column header row is right after
+        col_row = detail_row + 1
+        df_detail = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=col_row)
+
+        # Keep only rows that have Stock Length (ft) — these are the stock piece rows
+        df_detail = df_detail.dropna(subset=["Stock Length (ft)"])
+        df_detail = df_detail[pd.to_numeric(df_detail["Stock Length (ft)"], errors="coerce").notna()]
+
+        # Group by (Part Number, Stock Length (ft)) and count rows = number of stock pieces
+        df_detail["Stock Length (ft)"] = pd.to_numeric(df_detail["Stock Length (ft)"], errors="coerce")
+        df_detail["Part Number"] = df_detail["Part Number"].fillna("").astype(str).str.strip()
+
+        grouped = (
+            df_detail.groupby(["Part Number", "Stock Length (ft)"])
+            .size()
+            .reset_index(name="qty")
+        )
+
+        lines = []
+        for _, row in grouped.iterrows():
+            length_ft = float(row["Stock Length (ft)"])
+            length_in = round(length_ft * 12, 3)
+            lines.append({
+                "profile":     str(row["Part Number"]),
+                "length_in":   length_in,
+                "length_ft":   round(length_ft, 3),
+                "qty":         int(row["qty"]),
+                # PO-specific fields — user fills in app
+                "alloy":       "6063-T6",
+                "finish":      "",
+                "lead_time":   "3-4 weeks",
+                "tooling":     "",
+                "die_setup":   "",
+                "unit_price":  0.0,
+                "um":          "Pc",
+            })
+        return lines, None
+    except Exception as e:
+        return [], str(e)
+
+
+# ─────────────────────────────────────────────────────────────
+# ALUMINUM PO DOCX GENERATOR
+# ─────────────────────────────────────────────────────────────
+def generate_aluminum_po_docx(
+    vendor_name, vendor_contact, vendor_email, vendor_address,
+    ship_to_lines, job_number, job_location,
+    po_date, po_number, requisitioner,
+    shipped_via, fob_point, terms,
+    al_lines,          # list of dicts with profile, length_in, qty, alloy, finish, lead_time, tooling, die_setup, unit_price, um
+    packaging_note="Fully Corrugated Bundles, Paper Layer Separation",
+    logo_path=None,
+):
+    doc = DocxDocument()
+    for section in doc.sections:
+        section.top_margin    = Cm(1.27)
+        section.bottom_margin = Cm(1.27)
+        section.left_margin   = Cm(1.27)
+        section.right_margin  = Cm(1.27)
+
+    style = doc.styles["Normal"]
+    style.font.name = "Arial"
+    style.font.size = Pt(9)
+
+    subtotal   = sum(l["unit_price"] * l["qty"] for l in al_lines)
+    grand_total = subtotal  # shipping/tax added below if non-zero
+
+    table = doc.add_table(rows=0, cols=9)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.style = "Table Grid"
+    # Columns: Item# | Profile# | Alloy | Finish | Length(in) | Lead Time | Pcs | Unit Price | Total
+    col_widths = [Cm(0.8), Cm(1.8), Cm(1.8), Cm(2.8), Cm(1.6), Cm(2.2), Cm(1.2), Cm(2.0), Cm(2.2)]
+    for i, w in enumerate(col_widths):
+        table.columns[i].width = w
+
+    # ── Logo + PURCHASE ORDER ──
+    row = table.add_row()
+    c = row.cells[0]; c.merge(row.cells[3])
+    if logo_path and os.path.exists(logo_path):
+        c.paragraphs[0].add_run().add_picture(logo_path, width=Inches(1.5))
+    c = row.cells[4]; c.merge(row.cells[8])
+    p = c.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = p.add_run("PURCHASE ORDER")
+    run.bold = True; run.font.size = Pt(16); run.font.small_caps = True
+
+    # ── TO / SHIP TO / PO NUMBER ──
+    row = table.add_row()
+    c = row.cells[0]; c.merge(row.cells[2])
+    p = c.paragraphs[0]; run = p.add_run("TO:"); run.bold = True; run.font.small_caps = True
+    if vendor_contact: c.add_paragraph().add_run(vendor_contact)
+    c.add_paragraph().add_run(vendor_name)
+    if vendor_address:
+        for ln in vendor_address.split("\n"):
+            if ln.strip(): c.add_paragraph().add_run(ln)
+    c.add_paragraph()
+    p = c.add_paragraph(); p.add_run(f"JOB NO.: {job_number}").bold = True
+    if job_location:
+        c.add_paragraph().add_run(f"JOB LOCATION: {job_location}").bold = True
+
+    c = row.cells[3]; c.merge(row.cells[5])
+    p = c.paragraphs[0]; run = p.add_run("SHIP TO:"); run.bold = True; run.font.small_caps = True
+    for ln in ship_to_lines: c.add_paragraph().add_run(ln)
+
+    c = row.cells[6]; c.merge(row.cells[8])
+    p = c.paragraphs[0]; run = p.add_run("P.O. Number:"); run.bold = True
+    c.add_paragraph().add_run(po_number)
+    c.add_paragraph().add_run(
+        "The P.O. number must appear on all related correspondence, shipping papers, and invoices."
+    ).font.size = Pt(7)
+
+    # ── Spacer ──
+    row = table.add_row(); row.cells[0].merge(row.cells[8])
+
+    # ── PO metadata headers ──
+    row = table.add_row()
+    for i, h in enumerate(["P.O. DATE", "P.O. NUMBER", "REQUISITIONER",
+                            "SHIPPED VIA", "F.O.B. POINT", "TERMS", "", "", ""]):
+        if h:
+            p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run(h); run.bold = True; run.font.size = Pt(7); run.font.small_caps = True
+            _add_shading(row.cells[i], "D9E2F3")
+
+    # ── PO metadata values ──
+    row = table.add_row()
+    for i, v in enumerate([po_date, po_number, requisitioner, shipped_via, fob_point, terms, "", "", ""]):
+        p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run(str(v)).font.size = Pt(9)
+
+    # ── Spacer ──
+    row = table.add_row(); row.cells[0].merge(row.cells[8])
+
+    # ── Line item headers ──
+    headers = ["ITEM#", "PROFILE\nNUMBER", "ALLOY/\nTEMPER", "FINISH",
+               "LENGTH\n(INCHES)", "APPROX.\nLEAD TIME", "PCS",
+               "UNIT\nPRICE/PC", "TOTAL"]
+    row = table.add_row()
+    for i, h in enumerate(headers):
+        row.cells[i].width = col_widths[i]
+        p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run(h); run.bold = True; run.font.size = Pt(7.5); run.font.small_caps = True
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        _add_shading(row.cells[i], "2E75B6")
+
+    # ── Line items ──
+    for idx, line in enumerate(al_lines):
+        row = table.add_row()
+        line_total = line["unit_price"] * line["qty"]
+        unit_price_str = f"${line['unit_price']:,.2f}" if line["unit_price"] else "-"
+        tooling_str    = f"${line['tooling']:,.2f}" if line.get("tooling") and line["tooling"] else "-"
+        vals = [
+            str(idx + 1),
+            line["profile"],
+            line.get("alloy", "6063-T6"),
+            line.get("finish", ""),
+            str(line["length_in"]),
+            line.get("lead_time", ""),
+            str(line["qty"]),
+            unit_price_str,
+            f"${line_total:,.2f}" if line_total else "-",
+        ]
+        for i, v in enumerate(vals):
+            row.cells[i].width = col_widths[i]
+            p = row.cells[i].paragraphs[0]
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            if i == 3: p.alignment = WD_ALIGN_PARAGRAPH.LEFT   # Finish left-aligned
+            if i == 8: p.alignment = WD_ALIGN_PARAGRAPH.RIGHT  # Total right-aligned
+            p.add_run(v).font.size = Pt(9)
+
+    # ── Empty buffer rows ──
+    for _ in range(3):
+        row = table.add_row()
+        row.cells[0].merge(row.cells[8])
+
+    # ── Packing + Subtotal ──
+    row = table.add_row()
+    c = row.cells[0]; c.merge(row.cells[5])
+    run = c.paragraphs[0].add_run(f"Packing: {packaging_note}")
+    run.underline = True; run.font.size = Pt(9)
+    c = row.cells[6]; c.merge(row.cells[7])
+    c.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    c.paragraphs[0].add_run("SUBTOTAL").font.size = Pt(9)
+    row.cells[8].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = row.cells[8].paragraphs[0].add_run(f"${subtotal:,.2f}"); run.bold = True; run.font.size = Pt(9)
+
+    def _cost_row_al(label, amount_str):
+        r = table.add_row()
+        r.cells[0].merge(r.cells[5])
+        # Instructions in left cell (first cost row only)
+        c2 = r.cells[6]; c2.merge(r.cells[7])
+        c2.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        c2.paragraphs[0].add_run(label).font.size = Pt(9)
+        r.cells[8].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        r.cells[8].paragraphs[0].add_run(amount_str).font.size = Pt(9)
+
+    _cost_row_al("SALES TAX", "")
+    _cost_row_al("SHIPPING AND HANDLING", "")
+
+    # ── Terms row ──
+    row = table.add_row()
+    c = row.cells[0]; c.merge(row.cells[5])
+    for ln in [
+        "1. Enter this order in accordance with the prices, terms, delivery method, and specifications listed in this purchase order.",
+        "2. Please notify us immediately if you are unable to ship as specified.",
+        "3. Send Invoices to accounts@inovues.com",
+        "4. Send all correspondence to:",
+        "   INOVUES, INC.",
+        "   2700 Post Oak Blvd, 2100, Houston, TX 77056",
+        "   (833) 466-8837 (INO-VUES)",
+        "   info@inovues.com",
+    ]:
+        c.add_paragraph().add_run(ln).font.size = Pt(7)
+    c2 = row.cells[6]; c2.merge(row.cells[7])
+    c2.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    c2.paragraphs[0].add_run("TOTAL").bold = True
+    row.cells[8].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = row.cells[8].paragraphs[0].add_run(f"${subtotal:,.2f}"); run.bold = True; run.font.size = Pt(10)
+
+    # ── Authorized by ──
+    row = table.add_row()
+    row.cells[0].merge(row.cells[4])
+    c = row.cells[5]; c.merge(row.cells[7])
+    c.paragraphs[0].add_run("Authorized by _____________________").font.size = Pt(9)
+    row.cells[8].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    row.cells[8].paragraphs[0].add_run(po_date).font.size = Pt(9)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
 # ─────────────────────────────────────────────────────────────
 # PO DOCX GENERATOR (reused from SWR03111.py)
 # ─────────────────────────────────────────────────────────────
@@ -464,7 +709,7 @@ st.caption("Generate Glass and Aluminium Purchase Orders from Odoo project files
 po_type = st.radio("Select PO Type", ["Glass PO", "Aluminium PO"],
                    horizontal=True, label_visibility="collapsed")
 po_type_key = "Glass" if po_type == "Glass PO" else "Aluminium"
-file_keyword = "Glass" if po_type_key == "Glass" else "AggCutOnly"
+file_keyword = "Glass" if po_type_key == "Glass" else "cutting_list"
 
 st.divider()
 
@@ -515,74 +760,55 @@ if selected_project:
             if po_type_key == "Glass":
                 line_items, parse_err = parse_glass_file(file_bytes)
             else:
-                line_items, parse_err = parse_aggcutonly_file(file_bytes)
+                line_items, parse_err = parse_optimizer_file(file_bytes)
 
             if parse_err:
                 st.error(f"Could not parse file: {parse_err}")
                 line_items = []
 
 # ── Manual upload fallback ──
+upload_label = "cutting_list optimizer .xlsx file" if po_type_key == "Aluminium" else "Glass .xlsx file"
 with st.expander("Or upload a file manually (fallback)", expanded=not selected_project):
-    uploaded = st.file_uploader(f"Upload {file_keyword} .xlsx file", type=["xlsx"])
+    uploaded = st.file_uploader(f"Upload {upload_label}", type=["xlsx"])
     if uploaded:
         file_bytes = uploaded.read()
         if po_type_key == "Glass":
             line_items, parse_err = parse_glass_file(file_bytes)
         else:
-            line_items, parse_err = parse_aggcutonly_file(file_bytes)
+            line_items, parse_err = parse_optimizer_file(file_bytes)
         if parse_err:
             st.error(f"Could not parse file: {parse_err}")
             line_items = []
 
-# ── Show line items if we have them ──
-if line_items:
+# ══════════════════════════════════════════════════════════════
+# GLASS PO FLOW
+# ══════════════════════════════════════════════════════════════
+if line_items and po_type_key == "Glass":
     st.divider()
     st.subheader(f"Step 2 — Review & Edit Line Items ({len(line_items)} lines)")
 
-    if po_type_key == "Glass":
-        total_qty  = sum(l["qty"] for l in line_items)
-        total_area = sum(l["area_total"] for l in line_items)
-        st.write(f"**{total_qty} pieces | {total_area:.2f} ft² total**")
+    total_qty  = sum(l["qty"] for l in line_items)
+    total_area = sum(l["area_total"] for l in line_items)
+    st.write(f"**{total_qty} pieces | {total_area:.2f} ft² total**")
 
-        # Description inputs
-        st.write("Enter description for each glass size:")
-        first_desc = st.text_input("Description for all lines (default)",
-                                   placeholder="e.g. GT1 – 10mm Leadus VIG: 5Tlow-E+V+5T",
-                                   key="glass_desc_default")
-        for i, line in enumerate(line_items):
-            line["description"] = first_desc
+    st.write("Enter description for each glass size:")
+    first_desc = st.text_input("Description for all lines (default)",
+                               placeholder="e.g. GT1 – 10mm Leadus VIG: 5Tlow-E+V+5T",
+                               key="glass_desc_default")
+    for line in line_items:
+        line["description"] = first_desc
 
-        # Preview table
-        preview = pd.DataFrame([{
-            "Tag": l["tag"], "Size": l["size_str"],
-            "Area Each (ft²)": l["area_each"], "Qty": l["qty"],
-            "Area Total (ft²)": l["area_total"],
-        } for l in line_items])
-        st.dataframe(preview, use_container_width=True, hide_index=True)
-
-    else:  # Aluminium
-        total_qty = sum(l["qty"] for l in line_items)
-        total_len = sum(l["qty"] * l["length_ft"] for l in line_items)
-        st.write(f"**{total_qty} pieces | {total_len:.2f} ft total length**")
-
-        # For aluminium, size_str and area_total need to be set
-        for l in line_items:
-            l["size_str"]   = f"{l['length_in']:.3f}\""
-            l["area_total"] = round(l["qty"] * l["length_ft"], 3)  # total linear feet
-            l["area_each"]  = l["length_ft"]
-
-        preview = pd.DataFrame([{
-            "Part #": l["part_number"], "Length (in)": l["length_in"],
-            "Length (ft)": l["length_ft"], "Qty": l["qty"],
-            "Total ft": l["area_total"],
-        } for l in line_items])
-        st.dataframe(preview, use_container_width=True, hide_index=True)
+    preview = pd.DataFrame([{
+        "Tag": l["tag"], "Size": l["size_str"],
+        "Area Each (ft²)": l["area_each"], "Qty": l["qty"],
+        "Area Total (ft²)": l["area_total"],
+    } for l in line_items])
+    st.dataframe(preview, use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("Step 3 — Vendor & PO Details")
 
     vcol1, vcol2 = st.columns(2)
-
     with vcol1:
         vendor_map, vendor_err = fetch_vendors()
         if vendor_err:
@@ -594,7 +820,6 @@ if line_items:
             with st.expander("Vendor details", expanded=False):
                 st.text(f"Email: {v.get('email','')}")
                 st.text(f"Address: {v.get('full_address','')}")
-
     with vcol2:
         project_number = st.text_input("Project / PO Number", value="INO-")
         requisitioner  = st.text_input("Requisitioner", value="Stephan Ketterer")
@@ -608,9 +833,7 @@ if line_items:
         fob_point = st.selectbox("F.O.B. Point", ["CIF", "DDP", "DAP", "EXW", "FOB"], index=1)
         terms     = st.text_input("Terms", value="Net 30")
     with dcol3:
-        unit_label  = "ft²" if po_type_key == "Glass" else "lin ft"
-        price_label = f"Price per {unit_label} ($)"
-        price_per_unit = st.number_input(price_label, value=0.0, min_value=0.0,
+        price_per_unit = st.number_input("Price per ft² ($)", value=0.0, min_value=0.0,
                                           step=0.01, format="%.2f")
 
     ship_to_text = st.text_area("Ship To", value=SHIP_TO_DEFAULT, height=100)
@@ -624,89 +847,180 @@ if line_items:
         shipping_cost = st.number_input("Shipping ($)", value=0.0, min_value=0.0, format="%.2f")
         other_cost    = st.number_input("Other ($)", value=0.0, min_value=0.0, format="%.2f")
 
-    # Totals
-    if po_type_key == "Glass":
-        subtotal = sum(l["area_total"] for l in line_items) * price_per_unit
-    else:
-        subtotal = sum(l["area_total"] for l in line_items) * price_per_unit
+    subtotal    = sum(l["area_total"] for l in line_items) * price_per_unit
     grand_total = subtotal + sales_tax + packaging_cost + shipping_cost + other_cost
     st.write(f"**Subtotal: ${subtotal:,.2f}  |  Grand Total: ${grand_total:,.2f}**")
 
     st.divider()
     st.subheader("Step 4 — Generate PO")
-
     vendor_ready = selected_vendor is not None and vendor_map
-
     gcol1, gcol2 = st.columns(2)
 
     with gcol1:
-        if st.button("📄 Generate PO (.docx)", disabled=not vendor_ready):
+        if st.button("📄 Generate PO (.docx)", disabled=not vendor_ready, key="glass_gen"):
             v = vendor_map[selected_vendor]
             po_buf = generate_po_docx(
-                vendor_name=v["name"],
-                vendor_contact=v.get("contact_name", ""),
-                vendor_email=v.get("email", ""),
-                vendor_address=v.get("full_address", ""),
+                vendor_name=v["name"], vendor_contact=v.get("contact_name", ""),
+                vendor_email=v.get("email", ""), vendor_address=v.get("full_address", ""),
                 ship_to_lines=[ln for ln in ship_to_text.split("\n") if ln.strip()],
-                job_number=project_number,
-                job_location=job_location,
-                po_date=datetime.now().strftime("%m/%d/%Y"),
-                po_number=project_number,
-                requisitioner=requisitioner,
-                lead_time=lead_time,
-                shipped_via=shipped_via,
-                fob_point=fob_point,
-                terms=terms,
-                glass_lines=line_items,
-                price_per_sqft=price_per_unit,
-                packaging_cost=packaging_cost,
-                shipping_cost=shipping_cost,
-                sales_tax=sales_tax,
-                other_cost=other_cost,
-                packaging_note=packaging_note,
-                unit_label=unit_label,
+                job_number=project_number, job_location=job_location,
+                po_date=datetime.now().strftime("%m/%d/%Y"), po_number=project_number,
+                requisitioner=requisitioner, lead_time=lead_time, shipped_via=shipped_via,
+                fob_point=fob_point, terms=terms, glass_lines=line_items,
+                price_per_sqft=price_per_unit, packaging_cost=packaging_cost,
+                shipping_cost=shipping_cost, sales_tax=sales_tax, other_cost=other_cost,
+                packaging_note=packaging_note, unit_label="ft²",
             )
             st.session_state["po_buf"] = po_buf.getvalue()
-            st.session_state["po_buf_name"] = (
-                f"INOVUES_PO_{project_number}_{po_type_key}_{datetime.now().strftime('%Y%m%d')}.docx"
-            )
+            st.session_state["po_buf_name"] = f"INOVUES_PO_{project_number}_Glass_{datetime.now().strftime('%Y%m%d')}.docx"
             st.success("✅ PO document ready!")
-
         if "po_buf" in st.session_state:
-            st.download_button(
-                "💾 Download PO .docx",
-                data=st.session_state["po_buf"],
-                file_name=st.session_state.get("po_buf_name", "INOVUES_PO.docx"),
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
+            st.download_button("💾 Download PO .docx", data=st.session_state["po_buf"],
+                               file_name=st.session_state.get("po_buf_name", "INOVUES_PO.docx"),
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
     with gcol2:
-        if st.button("📝 Create Draft PO in Odoo", type="primary", disabled=not vendor_ready):
+        if st.button("📝 Create Draft PO in Odoo", type="primary", disabled=not vendor_ready, key="glass_odoo"):
             if "po_buf" not in st.session_state:
-                st.warning("Generate the .docx first (click the button on the left).")
+                st.warning("Generate the .docx first.")
             else:
                 with st.spinner("Creating PO in Odoo..."):
                     try:
                         v = vendor_map[selected_vendor]
-                        po_buf_io = io.BytesIO(st.session_state["po_buf"])
                         po_id, po_name = create_odoo_po(
-                            vendor=v,
-                            po_lines=line_items,
-                            price_per_unit=price_per_unit,
-                            project_number=project_number,
-                            project_name=selected_project or "",
-                            po_number=project_number,
-                            requisitioner=requisitioner,
-                            subtotal=subtotal,
-                            grand_total=grand_total,
-                            po_buf=po_buf_io,
-                            po_type=po_type_key,
-                            po_date_str=datetime.now().strftime("%m/%d/%Y"),
+                            vendor=v, po_lines=line_items, price_per_unit=price_per_unit,
+                            project_number=project_number, project_name=selected_project or "",
+                            po_number=project_number, requisitioner=requisitioner,
+                            subtotal=subtotal, grand_total=grand_total,
+                            po_buf=io.BytesIO(st.session_state["po_buf"]),
+                            po_type="Glass", po_date_str=datetime.now().strftime("%m/%d/%Y"),
                         )
                         st.success(f"✅ Draft PO **{po_name}** created in Odoo!")
-                        st.info(f"🔗 Open in Odoo: {ODOO_URL}/web#id={po_id}&model=purchase.order&view_type=form")
+                        st.info(f"🔗 {ODOO_URL}/web#id={po_id}&model=purchase.order&view_type=form")
                     except Exception as e:
                         st.error(f"❌ Error: {str(e)}")
+
+# ══════════════════════════════════════════════════════════════
+# ALUMINIUM PO FLOW
+# ══════════════════════════════════════════════════════════════
+elif line_items and po_type_key == "Aluminium":
+    st.divider()
+    st.subheader(f"Step 2 — Review & Edit Line Items ({len(line_items)} lines)")
+    st.caption("Pre-filled from optimizer output. Adjust quantities and fill in pricing details.")
+
+    # ── Per-line editable fields ──
+    st.write("**Edit each line item:**")
+
+    # Shared fields header
+    sh1, sh2, sh3, sh4, sh5, sh6, sh7 = st.columns([1.5, 1.5, 2, 2, 1, 1.5, 1.5])
+    sh1.markdown("**Profile #**"); sh2.markdown("**Length (in)**")
+    sh3.markdown("**Alloy/Temper**"); sh4.markdown("**Finish**")
+    sh5.markdown("**Qty**"); sh6.markdown("**Lead Time**"); sh7.markdown("**Unit Price ($)**")
+
+    for i, line in enumerate(line_items):
+        c1, c2, c3, c4, c5, c6, c7 = st.columns([1.5, 1.5, 2, 2, 1, 1.5, 1.5])
+        line["profile"]    = c1.text_input("", value=line["profile"],    key=f"al_prof_{i}", label_visibility="collapsed")
+        line["length_in"]  = c2.number_input("", value=float(line["length_in"]), min_value=0.0, step=1.0, key=f"al_len_{i}", label_visibility="collapsed")
+        line["alloy"]      = c3.text_input("", value=line.get("alloy", "6063-T6"), key=f"al_alloy_{i}", label_visibility="collapsed")
+        line["finish"]     = c4.text_input("", value=line.get("finish", ""),       key=f"al_finish_{i}", label_visibility="collapsed")
+        line["qty"]        = c5.number_input("", value=int(line["qty"]), min_value=0, step=1, key=f"al_qty_{i}", label_visibility="collapsed")
+        line["lead_time"]  = c6.text_input("", value=line.get("lead_time", "3-4 weeks"), key=f"al_lead_{i}", label_visibility="collapsed")
+        line["unit_price"] = c7.number_input("", value=float(line.get("unit_price", 0.0)), min_value=0.0, step=0.01, format="%.2f", key=f"al_price_{i}", label_visibility="collapsed")
+
+    total_pcs = sum(l["qty"] for l in line_items)
+    subtotal_al = sum(l["unit_price"] * l["qty"] for l in line_items)
+    st.write(f"**{total_pcs} total pcs | Subtotal: ${subtotal_al:,.2f}**")
+
+    st.divider()
+    st.subheader("Step 3 — Vendor & PO Details")
+
+    vcol1, vcol2 = st.columns(2)
+    with vcol1:
+        vendor_map, vendor_err = fetch_vendors()
+        if vendor_err:
+            st.error(f"Could not load vendors: {vendor_err}")
+        selected_vendor = st.selectbox("Select Vendor", options=list(vendor_map.keys()),
+                                       index=None, placeholder="Choose a vendor...")
+        if selected_vendor:
+            v = vendor_map[selected_vendor]
+            with st.expander("Vendor details", expanded=False):
+                st.text(f"Email: {v.get('email','')}")
+                st.text(f"Address: {v.get('full_address','')}")
+    with vcol2:
+        project_number = st.text_input("Project / PO Number", value="INO-", key="al_proj_num")
+        requisitioner  = st.text_input("Requisitioner", value="Stephan Ketterer", key="al_req")
+        job_location   = st.text_input("Job Location", value="", key="al_job_loc")
+
+    dcol1, dcol2 = st.columns(2)
+    with dcol1:
+        shipped_via = st.selectbox("Shipped Via", ["Air", "Ground"], index=1, key="al_ship")
+        fob_point   = st.selectbox("F.O.B. Point", ["CIF", "DDP", "DAP", "EXW", "Shipping Point", "FOB"], index=4, key="al_fob")
+    with dcol2:
+        terms           = st.text_input("Terms", value="Per Quote", key="al_terms")
+        packaging_note  = st.text_input("Packing Note", value="Fully Corrugated Bundles, Paper Layer Separation", key="al_pack_note")
+
+    ship_to_text = st.text_area("Ship To", value=SHIP_TO_DEFAULT, height=100, key="al_ship_to")
+
+    grand_total_al = subtotal_al
+    st.write(f"**Grand Total: ${grand_total_al:,.2f}**")
+
+    st.divider()
+    st.subheader("Step 4 — Generate PO")
+    vendor_ready = selected_vendor is not None and vendor_map
+    gcol1, gcol2 = st.columns(2)
+
+    with gcol1:
+        if st.button("📄 Generate Aluminium PO (.docx)", disabled=not vendor_ready, key="al_gen"):
+            v = vendor_map[selected_vendor]
+            po_buf = generate_aluminum_po_docx(
+                vendor_name=v["name"], vendor_contact=v.get("contact_name", ""),
+                vendor_email=v.get("email", ""), vendor_address=v.get("full_address", ""),
+                ship_to_lines=[ln for ln in ship_to_text.split("\n") if ln.strip()],
+                job_number=project_number, job_location=job_location,
+                po_date=datetime.now().strftime("%m/%d/%Y"), po_number=project_number,
+                requisitioner=requisitioner, shipped_via=shipped_via,
+                fob_point=fob_point, terms=terms,
+                al_lines=line_items,
+                packaging_note=packaging_note,
+            )
+            st.session_state["al_po_buf"] = po_buf.getvalue()
+            st.session_state["al_po_buf_name"] = f"INOVUES_PO_{project_number}_Aluminium_{datetime.now().strftime('%Y%m%d')}.docx"
+            st.success("✅ Aluminium PO document ready!")
+        if "al_po_buf" in st.session_state:
+            st.download_button("💾 Download Aluminium PO .docx",
+                               data=st.session_state["al_po_buf"],
+                               file_name=st.session_state.get("al_po_buf_name", "INOVUES_PO_Aluminium.docx"),
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                               key="al_dl")
+
+    with gcol2:
+        if st.button("📝 Create Draft PO in Odoo", type="primary", disabled=not vendor_ready, key="al_odoo"):
+            if "al_po_buf" not in st.session_state:
+                st.warning("Generate the .docx first.")
+            else:
+                with st.spinner("Creating PO in Odoo..."):
+                    try:
+                        v = vendor_map[selected_vendor]
+                        # Map al_lines to the format create_odoo_po expects
+                        odoo_lines = [{
+                            "description": f"{l['profile']} — {l['length_in']}\" extrusion",
+                            "size_str":    f"{l['length_in']}\"",
+                            "area_total":  float(l["qty"]),
+                            "qty":         l["qty"],
+                        } for l in line_items]
+                        po_id, po_name = create_odoo_po(
+                            vendor=v, po_lines=odoo_lines, price_per_unit=1.0,
+                            project_number=project_number, project_name=selected_project or "",
+                            po_number=project_number, requisitioner=requisitioner,
+                            subtotal=subtotal_al, grand_total=grand_total_al,
+                            po_buf=io.BytesIO(st.session_state["al_po_buf"]),
+                            po_type="Aluminium", po_date_str=datetime.now().strftime("%m/%d/%Y"),
+                        )
+                        st.success(f"✅ Draft PO **{po_name}** created in Odoo!")
+                        st.info(f"🔗 {ODOO_URL}/web#id={po_id}&model=purchase.order&view_type=form")
+                    except Exception as e:
+                        st.error(f"❌ Error: {str(e)}")
+
 else:
     if selected_project:
         st.info("Select a file above to continue.")
