@@ -55,14 +55,21 @@ def fetch_projects():
         return {}, str(e)
 
 @st.cache_data(ttl=60, show_spinner="Fetching files from Odoo...")
-def fetch_project_attachments(project_id):
-    """Get all attachments from the latest SWR Cutlist task in this project."""
+def fetch_project_attachments(project_id, po_type_key="Glass"):
+    """Get attachments from the relevant tasks in this project.
+
+    For Glass POs, looks for SWR Cutlist tasks (which produce *_SWR_Glass_*.xlsx).
+    For Aluminium POs, looks for Cutting Optimization tasks (which produce cutting_list_*.xlsx).
+    """
     try:
         uid, models = get_odoo_connection()
 
-        # Find tasks in this project that have SWR Cutlist in the name
+        # Choose task name keyword based on PO type
+        task_keyword = "Cutting Optimization" if po_type_key == "Aluminium" else "SWR"
+
+        # Find tasks in this project matching the keyword
         tasks = odoo_call(models, uid, "project.task", "search_read",
-            [[("project_id", "=", project_id), ("name", "ilike", "SWR")]],
+            [[("project_id", "=", project_id), ("name", "ilike", task_keyword)]],
             {"fields": ["id", "name", "create_date"], "order": "create_date desc", "limit": 10})
 
         if not tasks:
@@ -733,7 +740,7 @@ line_items = []
 
 if selected_project:
     project_id = project_map[selected_project]
-    attachments, att_err = fetch_project_attachments(project_id)
+    attachments, att_err = fetch_project_attachments(project_id, po_type_key)
 
     if att_err:
         st.error(f"Could not fetch attachments: {att_err}")
