@@ -740,31 +740,50 @@ if selected_project:
     elif not attachments:
         st.warning("No Excel attachments found in this project's tasks.")
     else:
-        # Filter to relevant file type but allow user to see all
+        # Only show files matching the file_keyword for this PO type
         relevant = [a for a in attachments if file_keyword.lower() in a["name"].lower()]
-        all_files = relevant if relevant else attachments
 
-        with col_file:
-            file_options = {f"{a['name']}  (task: {a['task_name']})": a for a in all_files}
-            selected_file_key = st.selectbox(
-                f"Select file ({file_keyword} files shown first)",
-                options=list(file_options.keys()),
-                index=None,
-                placeholder="Choose a file..."
-            )
+        if not relevant:
+            with col_file:
+                if po_type_key == "Glass":
+                    st.warning(
+                        "⚠️ **No Glass files found in this project.**\n\n"
+                        "**Workflow to create one:**\n"
+                        "1. Open the **SWR Cutlist** app\n"
+                        "2. Run it on this project's window dimensions\n"
+                        "3. Save to Odoo — it will attach `..._SWR_Glass_...xlsx` to an Engineering task\n"
+                        "4. Come back here and refresh"
+                    )
+                else:
+                    st.warning(
+                        "⚠️ **No Cutting Optimizer files found in this project.**\n\n"
+                        "**Workflow to create one:**\n"
+                        "1. Open the **SWR Cutlist** app → save to Odoo (produces `..._SWR_AggCutOnly_...xlsx`)\n"
+                        "2. Open the **Cutting Optimizer** app → load that AggCutOnly file → save to Odoo (produces `cutting_list_...xlsx`)\n"
+                        "3. Come back here and refresh"
+                    )
+        else:
+            with col_file:
+                file_options = {f"{a['name']}  (task: {a['task_name']})": a for a in relevant}
+                selected_file_key = st.selectbox(
+                    f"Select {file_keyword} file",
+                    options=list(file_options.keys()),
+                    index=None,
+                    placeholder="Choose a file..."
+                )
 
-        if selected_file_key:
-            selected_attachment = file_options[selected_file_key]
-            file_bytes = base64.b64decode(selected_attachment["datas"])
+            if selected_file_key:
+                selected_attachment = file_options[selected_file_key]
+                file_bytes = base64.b64decode(selected_attachment["datas"])
 
-            if po_type_key == "Glass":
-                line_items, parse_err = parse_glass_file(file_bytes)
-            else:
-                line_items, parse_err = parse_optimizer_file(file_bytes)
+                if po_type_key == "Glass":
+                    line_items, parse_err = parse_glass_file(file_bytes)
+                else:
+                    line_items, parse_err = parse_optimizer_file(file_bytes)
 
-            if parse_err:
-                st.error(f"Could not parse file: {parse_err}")
-                line_items = []
+                if parse_err:
+                    st.error(f"Could not parse file: {parse_err}")
+                    line_items = []
 
 # ── Manual upload fallback ──
 upload_label = "cutting_list optimizer .xlsx file" if po_type_key == "Aluminium" else "Glass .xlsx file"
