@@ -828,7 +828,7 @@ if line_items and po_type_key == "Glass":
     dcol1, dcol2, dcol3 = st.columns(3)
     with dcol1:
         lead_time   = st.text_input("Lead Time", value="ASAP")
-        shipped_via = st.selectbox("Shipped Via", ["Air", "Ground"], index=0)
+        shipped_via = st.selectbox("Shipped Via", ["Air", "Ground"], index=1)
     with dcol2:
         fob_point = st.selectbox("F.O.B. Point", ["CIF", "DDP", "DAP", "EXW", "FOB"], index=1)
         terms     = st.text_input("Terms", value="Net 30")
