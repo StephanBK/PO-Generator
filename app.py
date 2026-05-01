@@ -98,7 +98,7 @@ def fetch_project_attachments(project_id, po_type_key="Glass"):
     except Exception as e:
         return [], str(e)
 
-@st.cache_data(ttl=120, show_spinner="Loading vendors from Odoo...")
+@st.cache_data(ttl=30, show_spinner="Loading vendors from Odoo...")
 def fetch_vendors():
     try:
         uid, models = get_odoo_connection()
