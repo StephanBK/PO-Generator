@@ -723,14 +723,17 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
     def oc(model, method, args, kwargs={}):
         return odoo_call(models, uid, model, method, args, kwargs)
 
-    # Find product
+    # Find product — fail loudly if not found rather than silently
+    # falling back to a random product (which would create a PO with
+    # the wrong product on every line and the user would never know).
     product_name = "SWR Glass Panel" if po_type == "Glass" else "SWR Aluminium Extrusion"
     product_ids = oc("product.product", "search", [[("name", "ilike", product_name)]])
     if not product_ids:
-        # Use any product as fallback
-        product_ids = oc("product.product", "search", [[("active", "=", True)]], {"limit": 1})
-    if not product_ids:
-        raise Exception(f"No product found. Please create a product named '{product_name}' in Odoo.")
+        raise Exception(
+            f"Product '{product_name}' not found in Odoo. "
+            f"Please create a product with that exact name (or one that contains it) "
+            f"before creating {po_type} POs."
+        )
 
     product_id = product_ids[0]
     order_lines = []
