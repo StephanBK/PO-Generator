@@ -148,6 +148,53 @@ def fetch_vendors():
     except Exception as e:
         return {}, str(e)
 
+@st.cache_data(ttl=300, show_spinner="Loading payment terms...")
+def fetch_payment_terms():
+    """Returns ({display_name: id}, error). Cached 5 min — these change rarely."""
+    try:
+        uid, models = get_odoo_connection()
+        terms = odoo_call(models, uid, "account.payment.term", "search_read",
+            [[("active", "=", True)]],
+            {"fields": ["id", "name"], "order": "sequence asc, id asc"})
+        return {t["name"]: t["id"] for t in terms}, None
+    except Exception as e:
+        return {}, str(e)
+
+@st.cache_data(ttl=300, show_spinner="Loading incoterms...")
+def fetch_incoterms():
+    """Returns ({code: id}, error). Cached 5 min."""
+    try:
+        uid, models = get_odoo_connection()
+        terms = odoo_call(models, uid, "account.incoterms", "search_read",
+            [[("active", "=", True)]],
+            {"fields": ["id", "code", "name"], "order": "code asc"})
+        # Display "DDP — DELIVERED DUTY PAID" but key by code so user picks easily
+        return {f"{t['code']} — {t['name']}": t["id"] for t in terms}, None
+    except Exception as e:
+        return {}, str(e)
+
+@st.cache_data(ttl=300, show_spinner="Loading users...")
+def fetch_users():
+    """Returns ({display_name: id}, error). Internal users only.
+    Used for fuzzy-matching the free-text requisitioner field to a user_id."""
+    try:
+        uid, models = get_odoo_connection()
+        users = odoo_call(models, uid, "res.users", "search_read",
+            [[("share", "=", False), ("active", "=", True)]],
+            {"fields": ["id", "name", "login"], "order": "name asc"})
+        # Build a map keyed by both name AND login email for fuzzy matching
+        user_map = {}
+        for u in users:
+            user_map[u["name"].lower()] = u["id"]
+            user_map[u["login"].lower()] = u["id"]
+            # Also map first name only for casual matches like "Stephan"
+            first = u["name"].split()[0].lower() if u["name"] else ""
+            if first and first not in user_map:
+                user_map[first] = u["id"]
+        return user_map, None
+    except Exception as e:
+        return {}, str(e)
+
 # ─────────────────────────────────────────────────────────────
 # FILE PARSERS
 # ─────────────────────────────────────────────────────────────
@@ -657,7 +704,20 @@ def generate_po_docx(
 # ─────────────────────────────────────────────────────────────
 def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_name,
                     po_number, requisitioner, subtotal, grand_total, po_buf,
-                    po_type, po_date_str):
+                    po_type, po_date_str,
+                    payment_term_id=None, incoterm_id=None,
+                    date_planned=None):
+    """Create a draft purchase.order in Odoo.
+
+    Newly-supported optional fields (Fix #2):
+      payment_term_id — int, account.payment.term ID. Maps from the Terms dropdown.
+      incoterm_id     — int, account.incoterms ID. Maps from the F.O.B. dropdown.
+      date_planned    — datetime.date or datetime.datetime. Maps from the Lead Time date picker.
+
+    The 'requisitioner' free-text field is fuzzy-matched against active internal
+    users; if a match is found, user_id is set on the PO. Otherwise it remains
+    free text in the .docx and chatter message only (preserves prior behavior).
+    """
     uid, models = get_odoo_connection()
 
     def oc(model, method, args, kwargs={}):
@@ -686,11 +746,32 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
             "price_unit":  line_total / line["qty"] if line["qty"] > 0 else 0.0,
         }))
 
-    po_id = oc("purchase.order", "create", [{
+    # Build the PO payload, only including optional fields when provided
+    po_vals = {
         "partner_id":  vendor["id"],
         "origin":      f"{project_number} / {po_type} PO",
         "order_line":  order_lines,
-    }])
+    }
+    if payment_term_id:
+        po_vals["payment_term_id"] = payment_term_id
+    if incoterm_id:
+        po_vals["incoterm_id"] = incoterm_id
+    if date_planned:
+        # Odoo expects "YYYY-MM-DD HH:MM:SS"
+        if hasattr(date_planned, "strftime"):
+            po_vals["date_planned"] = date_planned.strftime("%Y-%m-%d 12:00:00") \
+                if not hasattr(date_planned, "hour") else date_planned.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            po_vals["date_planned"] = str(date_planned)
+
+    # Fuzzy-match requisitioner free-text to a real Odoo user
+    user_map, _ = fetch_users()
+    if requisitioner and user_map:
+        matched_uid = user_map.get(requisitioner.strip().lower())
+        if matched_uid:
+            po_vals["user_id"] = matched_uid
+
+    po_id = oc("purchase.order", "create", [po_vals])
     po_data = oc("purchase.order", "read", [po_id], {"fields": ["name"]})
     po_name = po_data[0]["name"] if po_data else f"ID {po_id}"
 
@@ -869,11 +950,36 @@ if line_items and po_type_key == "Glass":
 
     dcol1, dcol2, dcol3 = st.columns(3)
     with dcol1:
-        lead_time   = st.text_input("Lead Time", value="ASAP")
+        # Lead Time → date picker (writes to date_planned in Odoo)
+        from datetime import timedelta
+        lead_date = st.date_input("Expected Delivery Date",
+                                  value=datetime.now().date() + timedelta(days=14),
+                                  help="Becomes 'date_planned' on the Odoo PO.")
+        lead_time = lead_date.strftime("%m/%d/%Y")  # human-readable for the .docx
         shipped_via = st.selectbox("Shipped Via", ["Air", "Ground"], index=1)
     with dcol2:
-        fob_point = st.selectbox("F.O.B. Point", ["CIF", "DDP", "DAP", "EXW", "FOB"], index=1)
-        terms     = st.text_input("Terms", value="Net 30")
+        # F.O.B. → dropdown of all 11 Odoo incoterms
+        incoterm_map, incoterm_err = fetch_incoterms()
+        if incoterm_err:
+            st.warning(f"Could not load incoterms: {incoterm_err}")
+        # Default to DDP (matches old hardcoded default)
+        incoterm_keys = list(incoterm_map.keys()) if incoterm_map else []
+        ddp_idx = next((i for i, k in enumerate(incoterm_keys) if k.startswith("DDP")), 0)
+        fob_label = st.selectbox("F.O.B. Point", incoterm_keys,
+                                  index=ddp_idx if incoterm_keys else None,
+                                  help="Becomes 'incoterm_id' on the Odoo PO.")
+        fob_point = fob_label.split(" — ")[0] if fob_label else ""  # short code for .docx
+
+        # Terms → dropdown of payment terms from Odoo
+        payterm_map, payterm_err = fetch_payment_terms()
+        if payterm_err:
+            st.warning(f"Could not load payment terms: {payterm_err}")
+        payterm_keys = list(payterm_map.keys()) if payterm_map else []
+        # Default to "30 Days" (closest match to old "Net 30" default)
+        net30_idx = next((i for i, k in enumerate(payterm_keys) if "30" in k.lower() and "balance" not in k.lower() and "10th" not in k.lower()), 0)
+        terms = st.selectbox("Payment Terms", payterm_keys,
+                              index=net30_idx if payterm_keys else None,
+                              help="Becomes 'payment_term_id' on the Odoo PO.")
     with dcol3:
         price_per_unit = st.number_input("Price per ft² ($)", value=0.0, min_value=0.0,
                                           step=0.01, format="%.2f")
@@ -936,6 +1042,9 @@ if line_items and po_type_key == "Glass":
                             subtotal=subtotal, grand_total=grand_total,
                             po_buf=io.BytesIO(st.session_state["po_buf"]),
                             po_type="Glass", po_date_str=datetime.now().strftime("%m/%d/%Y"),
+                            payment_term_id=payterm_map.get(terms) if terms else None,
+                            incoterm_id=incoterm_map.get(fob_label) if fob_label else None,
+                            date_planned=lead_date,
                         )
                         st.success(f"✅ Draft PO **{po_name}** created in Odoo!")
                         st.info(f"🔗 {ODOO_URL}/web#id={po_id}&model=purchase.order&view_type=form")
@@ -995,10 +1104,38 @@ elif line_items and po_type_key == "Aluminium":
 
     dcol1, dcol2 = st.columns(2)
     with dcol1:
+        from datetime import timedelta
+        lead_date_al = st.date_input("Expected Delivery Date",
+                                     value=datetime.now().date() + timedelta(days=28),
+                                     key="al_lead_date",
+                                     help="Becomes 'date_planned' on the Odoo PO.")
+        lead_time_al = lead_date_al.strftime("%m/%d/%Y")
         shipped_via = st.selectbox("Shipped Via", ["Air", "Ground"], index=1, key="al_ship")
-        fob_point   = st.selectbox("F.O.B. Point", ["CIF", "DDP", "DAP", "EXW", "Shipping Point", "FOB"], index=4, key="al_fob")
+        # F.O.B. dropdown
+        incoterm_map, incoterm_err = fetch_incoterms()
+        if incoterm_err:
+            st.warning(f"Could not load incoterms: {incoterm_err}")
+        incoterm_keys = list(incoterm_map.keys()) if incoterm_map else []
+        # Aluminium previously defaulted to "Shipping Point" (not a real incoterm).
+        # Use FOB as the closest official equivalent.
+        fob_idx = next((i for i, k in enumerate(incoterm_keys) if k.startswith("FOB")), 0)
+        fob_label = st.selectbox("F.O.B. Point", incoterm_keys,
+                                  index=fob_idx if incoterm_keys else None,
+                                  key="al_fob",
+                                  help="Becomes 'incoterm_id' on the Odoo PO.")
+        fob_point = fob_label.split(" — ")[0] if fob_label else ""
     with dcol2:
-        terms           = st.text_input("Terms", value="Per Quote", key="al_terms")
+        # Payment terms dropdown
+        payterm_map, payterm_err = fetch_payment_terms()
+        if payterm_err:
+            st.warning(f"Could not load payment terms: {payterm_err}")
+        payterm_keys = list(payterm_map.keys()) if payterm_map else []
+        # Aluminium default was "Per Quote" — closest match in Odoo is "30 Days"
+        net30_idx = next((i for i, k in enumerate(payterm_keys) if "30" in k.lower() and "balance" not in k.lower() and "10th" not in k.lower()), 0)
+        terms = st.selectbox("Payment Terms", payterm_keys,
+                              index=net30_idx if payterm_keys else None,
+                              key="al_terms",
+                              help="Becomes 'payment_term_id' on the Odoo PO.")
         packaging_note  = st.text_input("Packing Note", value="Fully Corrugated Bundles, Paper Layer Separation", key="al_pack_note")
 
     ship_to_text = st.text_area("Ship To", value=SHIP_TO_DEFAULT, height=100, key="al_ship_to")
@@ -1057,6 +1194,9 @@ elif line_items and po_type_key == "Aluminium":
                             subtotal=subtotal_al, grand_total=grand_total_al,
                             po_buf=io.BytesIO(st.session_state["al_po_buf"]),
                             po_type="Aluminium", po_date_str=datetime.now().strftime("%m/%d/%Y"),
+                            payment_term_id=payterm_map.get(terms) if terms else None,
+                            incoterm_id=incoterm_map.get(fob_label) if fob_label else None,
+                            date_planned=lead_date_al,
                         )
                         st.success(f"✅ Draft PO **{po_name}** created in Odoo!")
                         st.info(f"🔗 {ODOO_URL}/web#id={po_id}&model=purchase.order&view_type=form")
