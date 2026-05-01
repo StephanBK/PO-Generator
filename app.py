@@ -534,6 +534,19 @@ def generate_po_docx(
     unit_label="ft²",
     price_label="Price/ft²",
 ):
+    """Glass PO generator — 3-table structure to prevent column-width fighting.
+
+    Tables:
+      1. Header table (4 cols)  — logo + PURCHASE ORDER title + TO/SHIP TO/BILL TO
+      2. Metadata table (7 cols) — PO Date / Number / Requisitioner / Lead Time /
+         Shipped Via / F.O.B. Point / Terms
+      3. Line items table (8 cols) — Item # / Description / Unit Size / QTY /
+         Area Each / Total ft² / Unit Price / Total, plus totals rows
+
+    Line item math:
+      Unit Price = price_per_sqft × area_each (per piece)
+      Total per row = Unit Price × QTY (== price_per_sqft × area_total)
+    """
     doc = DocxDocument()
     for section in doc.sections:
         section.top_margin    = Cm(1.27)
@@ -548,25 +561,39 @@ def generate_po_docx(
     subtotal = sum(line["area_total"] * price_per_sqft for line in glass_lines)
     total    = subtotal + (sales_tax or 0) + (packaging_cost or 0) + (shipping_cost or 0) + (other_cost or 0)
 
-    table = doc.add_table(rows=0, cols=7)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
-    col_widths = [Cm(1.2), Cm(3.0), Cm(3.8), Cm(2.2), Cm(1.2), Cm(2.5), Cm(2.5)]
-    for i, w in enumerate(col_widths):
-        table.columns[i].width = w
+    # Disable autofit globally for a moment so our cell widths stick
+    def _disable_autofit(tbl):
+        tbl.autofit = False
+        tbl.allow_autofit = False
 
-    # Logo + PURCHASE ORDER header
-    row = table.add_row()
-    c = row.cells[0]; c.merge(row.cells[2])
+    # ─────────────────────────────────────────────────────────
+    # TABLE 1 — Header (logo + title + TO/SHIP TO/BILL TO)
+    # 4 columns of equal width (~4.3cm each, sums to ~17.3cm)
+    # ─────────────────────────────────────────────────────────
+    t1 = doc.add_table(rows=0, cols=4)
+    t1.alignment = WD_TABLE_ALIGNMENT.CENTER
+    t1.style = "Table Grid"
+    _disable_autofit(t1)
+    t1_widths = [Cm(4.3), Cm(4.3), Cm(4.3), Cm(4.4)]
+    for i, w in enumerate(t1_widths):
+        t1.columns[i].width = w
+
+    # Row 1: logo (cols 0-1) + PURCHASE ORDER title (cols 2-3)
+    row = t1.add_row()
+    for i, w in enumerate(t1_widths):
+        row.cells[i].width = w
+    c = row.cells[0]; c.merge(row.cells[1])
     if logo_path and os.path.exists(logo_path):
         c.paragraphs[0].add_run().add_picture(logo_path, width=Inches(1.5))
-    c = row.cells[3]; c.merge(row.cells[6])
+    c = row.cells[2]; c.merge(row.cells[3])
     p = c.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     run = p.add_run("PURCHASE ORDER")
     run.bold = True; run.font.size = Pt(16); run.font.small_caps = True
 
-    # TO / SHIP TO / BILL TO
-    row = table.add_row()
+    # Row 2: TO (cols 0-1) + SHIP TO (col 2) + BILL TO (col 3)
+    row = t1.add_row()
+    for i, w in enumerate(t1_widths):
+        row.cells[i].width = w
     c = row.cells[0]; c.merge(row.cells[1])
     p = c.paragraphs[0]; run = p.add_run("TO:"); run.bold = True; run.font.small_caps = True
     c.add_paragraph().add_run(vendor_name)
@@ -580,40 +607,77 @@ def generate_po_docx(
     if job_location:
         p = c.add_paragraph(); run = p.add_run(f"JOB LOCATION: {job_location}"); run.bold = True
 
-    c = row.cells[2]; c.merge(row.cells[4])
+    c = row.cells[2]
     p = c.paragraphs[0]; run = p.add_run("SHIP TO:"); run.bold = True; run.font.small_caps = True
     for ln in ship_to_lines: c.add_paragraph().add_run(ln)
 
-    c = row.cells[5]; c.merge(row.cells[6])
+    c = row.cells[3]
     p = c.paragraphs[0]; run = p.add_run("BILL TO:"); run.bold = True; run.font.small_caps = True
     for ln in ["INOVUES, INC.", "2700 Post Oak Blvd., 2100", "Houston, TX 77056",
                "accounts@inovues.com", "(833) 466-8837 (INO-VUES)"]:
         c.add_paragraph().add_run(ln)
 
-    # Spacer
-    row = table.add_row(); row.cells[0].merge(row.cells[6])
+    # Small spacer between tables
+    doc.add_paragraph()
 
-    # PO metadata headers
-    row = table.add_row()
-    for i, h in enumerate(["P.O. DATE", "P.O. NUMBER", "REQUISITIONER", "LEAD TIME",
-                            "SHIPPED VIA", "F.O.B. POINT", "TERMS"]):
+    # ─────────────────────────────────────────────────────────
+    # TABLE 2 — PO Metadata (7 cols, evenly distributed)
+    # Each column ~2.47cm; tweaked slightly by content length.
+    # ─────────────────────────────────────────────────────────
+    t2 = doc.add_table(rows=0, cols=7)
+    t2.alignment = WD_TABLE_ALIGNMENT.CENTER
+    t2.style = "Table Grid"
+    _disable_autofit(t2)
+    # PO DATE | PO NUMBER | REQUISITIONER | LEAD TIME | SHIPPED VIA | F.O.B. POINT | TERMS
+    t2_widths = [Cm(2.2), Cm(2.4), Cm(3.0), Cm(2.3), Cm(2.4), Cm(2.5), Cm(2.5)]
+    for i, w in enumerate(t2_widths):
+        t2.columns[i].width = w
+
+    meta_labels = ["P.O. DATE", "P.O. NUMBER", "REQUISITIONER", "LEAD TIME",
+                   "SHIPPED VIA", "F.O.B. POINT", "TERMS"]
+    meta_values = [po_date, po_number, requisitioner, lead_time,
+                   shipped_via, fob_point, terms]
+
+    # Header row
+    row = t2.add_row()
+    for i, h in enumerate(meta_labels):
+        row.cells[i].width = t2_widths[i]
         p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run(h); run.bold = True; run.font.size = Pt(7); run.font.small_caps = True
         _add_shading(row.cells[i], "D9E2F3")
 
-    # PO metadata values
-    row = table.add_row()
-    for i, v in enumerate([po_date, po_number, requisitioner, lead_time, shipped_via, fob_point, terms]):
+    # Value row
+    row = t2.add_row()
+    for i, v in enumerate(meta_values):
+        row.cells[i].width = t2_widths[i]
         p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run(str(v)).font.size = Pt(9)
 
     # Spacer
-    row = table.add_row(); row.cells[0].merge(row.cells[6])
+    doc.add_paragraph()
 
-    # Line item headers
-    row = table.add_row()
-    for i, h in enumerate(["ITEM#", "DESCRIPTION", f"UNIT SIZE", f"AREA EACH ({unit_label})",
-                            "QTY", f"TOTAL ({unit_label})", "TOTAL"]):
+    # ─────────────────────────────────────────────────────────
+    # TABLE 3 — Line Items (8 cols) + totals/footer rows
+    # Item # | Description | Unit Size | QTY | Area Each | Total ft² | Unit Price | Total
+    # ─────────────────────────────────────────────────────────
+    NCOLS = 8
+    LAST = NCOLS - 1
+    t3 = doc.add_table(rows=0, cols=NCOLS)
+    t3.alignment = WD_TABLE_ALIGNMENT.CENTER
+    t3.style = "Table Grid"
+    _disable_autofit(t3)
+    col_widths = [Cm(0.9), Cm(3.5), Cm(3.0), Cm(1.2), Cm(1.9), Cm(1.9), Cm(2.3), Cm(2.6)]
+    for i, w in enumerate(col_widths):
+        t3.columns[i].width = w
+
+    # Header row
+    line_headers = [
+        "ITEM #", "DESCRIPTION", "UNIT SIZE", "QTY",
+        f"AREA EACH ({unit_label})", f"TOTAL ({unit_label})",
+        "UNIT PRICE", "TOTAL",
+    ]
+    row = t3.add_row()
+    for i, h in enumerate(line_headers):
         row.cells[i].width = col_widths[i]
         p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run(h); run.bold = True; run.font.size = Pt(8); run.font.small_caps = True
@@ -621,44 +685,59 @@ def generate_po_docx(
         _add_shading(row.cells[i], "2E75B6")
 
     # Line items
+    align_map = {
+        0: WD_ALIGN_PARAGRAPH.CENTER,   # Item#
+        3: WD_ALIGN_PARAGRAPH.CENTER,   # QTY
+        4: WD_ALIGN_PARAGRAPH.RIGHT,    # Area Each
+        5: WD_ALIGN_PARAGRAPH.RIGHT,    # Total ft²
+        6: WD_ALIGN_PARAGRAPH.RIGHT,    # Unit Price
+        7: WD_ALIGN_PARAGRAPH.RIGHT,    # Total
+    }
     for idx, line in enumerate(glass_lines):
-        row = table.add_row()
+        row = t3.add_row()
+        unit_price = line["area_each"] * price_per_sqft
         line_total = line["area_total"] * price_per_sqft
-        vals = [str(idx + 1), line.get("description", ""), line.get("size_str", ""),
-                f"{line['area_each']:.3f}", str(line["qty"]),
-                f"{line['area_total']:.3f}", f"${line_total:,.2f}"]
+        vals = [
+            str(idx + 1),
+            line.get("description", ""),
+            line.get("size_str", ""),
+            str(line["qty"]),
+            f"{line['area_each']:.3f}",
+            f"{line['area_total']:.3f}",
+            f"${unit_price:,.2f}",
+            f"${line_total:,.2f}",
+        ]
         for i, v in enumerate(vals):
             row.cells[i].width = col_widths[i]
             p = row.cells[i].paragraphs[0]
-            if i == 0 or i >= 3: p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            if i == 6:           p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            if i in align_map:
+                p.alignment = align_map[i]
             p.add_run(v).font.size = Pt(9)
 
-    # Packaging + Subtotal
-    row = table.add_row()
-    c = row.cells[0]; c.merge(row.cells[3])
-    run = c.paragraphs[0].add_run(f"Packaging: {packaging_note}"); run.underline = True; run.font.size = Pt(9)
-    c = row.cells[4]; c.merge(row.cells[5])
-    c.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    c.paragraphs[0].add_run("SUBTOTAL").font.size = Pt(9)
-    row.cells[6].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = row.cells[6].paragraphs[0].add_run(f"${subtotal:,.2f}"); run.bold = True; run.font.size = Pt(9)
+    # Totals rows: cols 0-5 = label/notes area, col 6 = label, col 7 = amount
+    def _totals_row(label, amount, label_bold=False, amount_bold=False, font_size=9):
+        r = t3.add_row()
+        for i, w in enumerate(col_widths):
+            r.cells[i].width = w
+        left = r.cells[0]; left.merge(r.cells[5])
+        lab = r.cells[6]; lab.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        run_l = lab.paragraphs[0].add_run(label)
+        run_l.font.size = Pt(font_size); run_l.bold = label_bold
+        amt = r.cells[LAST]; amt.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        run_a = amt.paragraphs[0].add_run(f"${amount:,.2f}" if amount else "")
+        run_a.font.size = Pt(font_size); run_a.bold = amount_bold
+        return r, left
 
-    def _cost_row(label, amount):
-        r = table.add_row()
-        r.cells[0].merge(r.cells[3])
-        c2 = r.cells[4]; c2.merge(r.cells[5])
-        c2.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        c2.paragraphs[0].add_run(label).font.size = Pt(9)
-        r.cells[6].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        r.cells[6].paragraphs[0].add_run(f"${amount:,.2f}" if amount else "").font.size = Pt(9)
+    # Subtotal row — also carries the packaging note on the left
+    r, left = _totals_row("SUBTOTAL", subtotal, label_bold=False, amount_bold=True)
+    run = left.paragraphs[0].add_run(f"Packaging: {packaging_note}")
+    run.underline = True; run.font.size = Pt(9)
 
-    _cost_row("SALES TAX", sales_tax)
-    _cost_row("PACKAGING", packaging_cost)
+    _totals_row("SALES TAX", sales_tax)
+    _totals_row("PACKAGING", packaging_cost)
 
-    # Shipping row
-    row = table.add_row()
-    c = row.cells[0]; c.merge(row.cells[3])
+    # Shipping row — also carries the order-instructions block on the left
+    r, left = _totals_row("SHIPPING & HANDLING", shipping_cost)
     for ln in [
         "1. Enter this order in accordance with the prices, terms, delivery method, and specifications listed in this purchase order.",
         "2. Please notify us immediately if you are unable to ship as specified.",
@@ -668,31 +747,21 @@ def generate_po_docx(
         "   (833) 466-8837 (INO-VUES)",
         "   accounts@inovues.com",
     ]:
-        c.add_paragraph().add_run(ln).font.size = Pt(7)
-    c2 = row.cells[4]; c2.merge(row.cells[5])
-    c2.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    c2.paragraphs[0].add_run("SHIPPING & HANDLING").font.size = Pt(9)
-    row.cells[6].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    row.cells[6].paragraphs[0].add_run(f"${shipping_cost:,.2f}" if shipping_cost else "").font.size = Pt(9)
+        left.add_paragraph().add_run(ln).font.size = Pt(7)
 
-    _cost_row("OTHER", other_cost)
+    _totals_row("OTHER", other_cost)
+    _totals_row("TOTAL", total, label_bold=True, amount_bold=True, font_size=10)
 
-    # Total
-    row = table.add_row()
-    row.cells[0].merge(row.cells[3])
-    c = row.cells[4]; c.merge(row.cells[5])
-    c.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = c.paragraphs[0].add_run("TOTAL"); run.bold = True; run.font.size = Pt(10)
-    row.cells[6].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = row.cells[6].paragraphs[0].add_run(f"${total:,.2f}"); run.bold = True; run.font.size = Pt(10)
-
-    # Signature
-    row = table.add_row()
-    row.cells[0].merge(row.cells[3])
-    c = row.cells[4]; c.merge(row.cells[5])
-    run = c.paragraphs[0].add_run("Authorized by _____________________"); run.italic = True; run.font.size = Pt(9)
-    row.cells[6].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    row.cells[6].paragraphs[0].add_run(po_date).font.size = Pt(9)
+    # Signature row
+    row = t3.add_row()
+    for i, w in enumerate(col_widths):
+        row.cells[i].width = w
+    row.cells[0].merge(row.cells[5])
+    sig = row.cells[6]
+    run = sig.paragraphs[0].add_run("Authorized by _____________________")
+    run.font.size = Pt(9)
+    row.cells[LAST].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    row.cells[LAST].paragraphs[0].add_run(po_date).font.size = Pt(9)
 
     buf = io.BytesIO()
     doc.save(buf)
