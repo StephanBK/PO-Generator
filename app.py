@@ -127,7 +127,23 @@ def fetch_vendors():
             if country:
                 addr_parts.append(country)
             v["full_address"] = "\n".join(addr_parts)
+
+            # Pick contact: prefer child tagged 'Orders', else first child.
+            # The 'Orders' tag (res.partner.category) flags the primary ordering
+            # contact for a vendor — set it on whichever child should appear in POs.
             v["contact_name"] = ""
+            if v.get("child_ids"):
+                primary_ids = odoo_call(models, uid, "res.partner", "search",
+                    [[("id", "in", v["child_ids"]),
+                      ("category_id.name", "=", "Orders")]],
+                    {"limit": 1})
+                target_ids = primary_ids if primary_ids else v["child_ids"][:1]
+                contacts = odoo_call(models, uid, "res.partner", "read",
+                    [target_ids], {"fields": ["name", "email"]})
+                if contacts:
+                    v["contact_name"] = contacts[0].get("name", "")
+                    if not v.get("email"):
+                        v["email"] = contacts[0].get("email", "")
         return {v["name"]: v for v in vendors}, None
     except Exception as e:
         return {}, str(e)
