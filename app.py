@@ -8,7 +8,7 @@ from datetime import datetime
 from docx import Document as DocxDocument
 from docx.shared import Inches, Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 
 # ─────────────────────────────────────────────────────────────
@@ -18,6 +18,9 @@ ODOO_URL     = os.environ.get("ODOO_URL",     "https://inovues.odoo.com")
 ODOO_DB      = os.environ.get("ODOO_DB",      "inovues")
 ODOO_USER    = os.environ.get("ODOO_USER",    "sketterer@inovues.com")
 ODOO_API_KEY = os.environ.get("ODOO_API_KEY", "")
+
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ilogo.png")  # INOVUES logo for PO header
+LOGO_WIDTH_IN = 1.9  # logo width on the PO, in inches (horizontal logo)
 
 SHIP_TO_DEFAULT = "Momentum Glass, LLC\nAttn: INOVUES, INC.\n25825 Aldine Westfield Rd.\nSpring, TX 77373\n281.809.2830"
 
@@ -327,6 +330,16 @@ def parse_optimizer_file(file_bytes):
 # ─────────────────────────────────────────────────────────────
 # ALUMINUM PO DOCX GENERATOR
 # ─────────────────────────────────────────────────────────────
+def _add_logo(cell, logo_path, width_in=None):
+    """Place the logo in a table cell, centered horizontally and vertically."""
+    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    p = cell.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(4)
+    p.paragraph_format.space_after = Pt(4)
+    p.add_run().add_picture(logo_path, width=Inches(width_in or LOGO_WIDTH_IN))
+
+
 def generate_aluminum_po_docx(
     vendor_name, vendor_contact, vendor_email, vendor_address,
     ship_to_lines, job_number, job_location,
@@ -362,8 +375,9 @@ def generate_aluminum_po_docx(
     row = table.add_row()
     c = row.cells[0]; c.merge(row.cells[3])
     if logo_path and os.path.exists(logo_path):
-        c.paragraphs[0].add_run().add_picture(logo_path, width=Inches(1.5))
+        _add_logo(c, logo_path)
     c = row.cells[4]; c.merge(row.cells[8])
+    c.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
     p = c.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     run = p.add_run("PURCHASE ORDER")
     run.bold = True; run.font.size = Pt(16); run.font.small_caps = True
@@ -584,8 +598,9 @@ def generate_po_docx(
         row.cells[i].width = w
     c = row.cells[0]; c.merge(row.cells[1])
     if logo_path and os.path.exists(logo_path):
-        c.paragraphs[0].add_run().add_picture(logo_path, width=Inches(1.5))
+        _add_logo(c, logo_path)
     c = row.cells[2]; c.merge(row.cells[3])
+    c.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
     p = c.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     run = p.add_run("PURCHASE ORDER")
     run.bold = True; run.font.size = Pt(16); run.font.small_caps = True
@@ -1090,6 +1105,7 @@ if line_items and po_type_key == "Glass":
                 price_per_sqft=price_per_unit, packaging_cost=packaging_cost,
                 shipping_cost=shipping_cost, sales_tax=sales_tax, other_cost=other_cost,
                 packaging_note=packaging_note, unit_label="ft²",
+                logo_path=LOGO_PATH,
             )
             st.session_state["po_buf"] = po_buf.getvalue()
             st.session_state["po_buf_name"] = f"INOVUES_PO_{project_number}_Glass_{datetime.now().strftime('%Y%m%d')}.docx"
@@ -1233,6 +1249,7 @@ elif line_items and po_type_key == "Aluminium":
                 fob_point=fob_point, terms=terms,
                 al_lines=line_items,
                 packaging_note=packaging_note,
+                logo_path=LOGO_PATH,
             )
             st.session_state["al_po_buf"] = po_buf.getvalue()
             st.session_state["al_po_buf_name"] = f"INOVUES_PO_{project_number}_Aluminium_{datetime.now().strftime('%Y%m%d')}.docx"
