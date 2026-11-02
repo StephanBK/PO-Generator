@@ -892,7 +892,8 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
 # ─────────────────────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────────────────────
-st.image("ilogo.png", width=180) if os.path.exists("ilogo.png") else None
+if os.path.exists(LOGO_PATH):
+    st.image(LOGO_PATH, width=180)
 st.title("📝 INOVUES PO Generator")
 st.caption("Generate Glass and Aluminium Purchase Orders from Odoo project files")
 
