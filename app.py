@@ -22,6 +22,9 @@ ODOO_API_KEY = os.environ.get("ODOO_API_KEY", "")
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ilogo.png")  # INOVUES logo for PO header
 LOGO_WIDTH_IN = 1.9  # logo width on the PO, in inches (horizontal logo)
 
+# INOVUES brand teal, sampled from ilogo.png. Used for both PO table header rows (white text on top).
+BRAND_TEAL = "118DA1"
+
 SHIP_TO_DEFAULT = "Momentum Glass, LLC\nAttn: INOVUES, INC.\n25825 Aldine Westfield Rd.\nSpring, TX 77373\n281.809.2830"
 
 sq_inches_to_sq_feet = 1 / 144
@@ -363,13 +366,22 @@ def generate_aluminum_po_docx(
     subtotal   = sum(l["unit_price"] * l["qty"] for l in al_lines)
     grand_total = subtotal  # shipping/tax added below if non-zero
 
-    table = doc.add_table(rows=0, cols=9)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
+    # 3 tables, like the glass PO: header (9 cols) / PO metadata (6 cols) / line items (9 cols).
+    # The metadata gets its own table so its 6 fields are not forced into the line-item columns.
+    # All 3 tables sum to 16.8cm so their edges line up.
     # Columns: Item# | Profile# | Alloy | Finish | Length(in) | Lead Time | Pcs | Unit Price | Total
-    col_widths = [Cm(0.8), Cm(1.8), Cm(1.8), Cm(2.8), Cm(1.6), Cm(2.2), Cm(1.2), Cm(2.0), Cm(2.2)]
-    for i, w in enumerate(col_widths):
-        table.columns[i].width = w
+    col_widths = [Cm(1.2), Cm(1.8), Cm(1.8), Cm(2.8), Cm(1.6), Cm(2.2), Cm(1.2), Cm(2.0), Cm(2.2)]
+
+    def _new_table(widths):
+        t = doc.add_table(rows=0, cols=len(widths))
+        t.alignment = WD_TABLE_ALIGNMENT.CENTER
+        t.style = "Table Grid"
+        t.autofit = False
+        for i, w in enumerate(widths):
+            t.columns[i].width = w
+        return t
+
+    table = _new_table(col_widths)
 
     # ── Logo + PURCHASE ORDER ──
     row = table.add_row()
@@ -407,29 +419,33 @@ def generate_aluminum_po_docx(
         "The P.O. number must appear on all related correspondence, shipping papers, and invoices."
     ).font.size = Pt(7)
 
-    # ── Spacer ──
-    row = table.add_row(); row.cells[0].merge(row.cells[8])
+    doc.add_paragraph()  # spacer
 
-    # ── PO metadata headers ──
-    row = table.add_row()
+    # ── PO metadata table (own widths; sums to 16.8cm) ──
+    meta_widths = [Cm(2.4), Cm(3.0), Cm(3.0), Cm(2.2), Cm(2.6), Cm(3.6)]
+    meta = _new_table(meta_widths)
+    row = meta.add_row()
     for i, h in enumerate(["P.O. DATE", "P.O. NUMBER", "REQUISITIONER",
-                            "SHIPPED VIA", "F.O.B. POINT", "TERMS", "", "", ""]):
-        if h:
-            p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = p.add_run(h); run.bold = True; run.font.size = Pt(7); run.font.small_caps = True
-            _add_shading(row.cells[i], "D9E2F3")
+                           "SHIPPED VIA", "FREIGHT TERMS", "TERMS"]):
+        row.cells[i].width = meta_widths[i]
+        p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run(h); run.bold = True; run.font.size = Pt(7); run.font.small_caps = True
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        _add_shading(row.cells[i], BRAND_TEAL)
 
-    # ── PO metadata values ──
-    row = table.add_row()
-    for i, v in enumerate([po_date, po_number, requisitioner, shipped_via, fob_point, terms, "", "", ""]):
+    row = meta.add_row()
+    for i, v in enumerate([po_date, po_number, requisitioner, shipped_via, fob_point, terms]):
+        row.cells[i].width = meta_widths[i]
         p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run(str(v)).font.size = Pt(9)
 
-    # ── Spacer ──
-    row = table.add_row(); row.cells[0].merge(row.cells[8])
+    doc.add_paragraph()  # spacer
+
+    # ── Line items table (same 9 columns as the header table) ──
+    table = _new_table(col_widths)
 
     # ── Line item headers ──
-    headers = ["ITEM#", "PROFILE\nNUMBER", "ALLOY/\nTEMPER", "FINISH",
+    headers = ["ITEM\n#", "PROFILE\nNUMBER", "ALLOY/\nTEMPER", "FINISH",
                "LENGTH\n(INCHES)", "APPROX.\nLEAD TIME", "PCS",
                "UNIT\nPRICE/PC", "TOTAL"]
     row = table.add_row()
@@ -438,7 +454,7 @@ def generate_aluminum_po_docx(
         p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run(h); run.bold = True; run.font.size = Pt(7.5); run.font.small_caps = True
         run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        _add_shading(row.cells[i], "2E75B6")
+        _add_shading(row.cells[i], BRAND_TEAL)
 
     # ── Line items ──
     for idx, line in enumerate(al_lines):
@@ -553,7 +569,7 @@ def generate_po_docx(
     Tables:
       1. Header table (4 cols)  — logo + PURCHASE ORDER title + TO/SHIP TO/BILL TO
       2. Metadata table (7 cols) — PO Date / Number / Requisitioner / Lead Time /
-         Shipped Via / F.O.B. Point / Terms
+         Shipped Via / Freight Terms / Terms
       3. Line items table (8 cols) — Item # / Description / Unit Size / QTY /
          Area Each / Total ft² / Unit Price / Total, plus totals rows
 
@@ -582,13 +598,13 @@ def generate_po_docx(
 
     # ─────────────────────────────────────────────────────────
     # TABLE 1 — Header (logo + title + TO/SHIP TO/BILL TO)
-    # 4 columns of equal width (~4.3cm each, sums to ~17.3cm)
+    # 4 columns of equal width (4.4cm each, sums to 17.6cm; all 3 tables must sum to 17.6cm)
     # ─────────────────────────────────────────────────────────
     t1 = doc.add_table(rows=0, cols=4)
     t1.alignment = WD_TABLE_ALIGNMENT.CENTER
     t1.style = "Table Grid"
     _disable_autofit(t1)
-    t1_widths = [Cm(4.3), Cm(4.3), Cm(4.3), Cm(4.4)]
+    t1_widths = [Cm(4.4), Cm(4.4), Cm(4.4), Cm(4.4)]
     for i, w in enumerate(t1_widths):
         t1.columns[i].width = w
 
@@ -643,13 +659,13 @@ def generate_po_docx(
     t2.alignment = WD_TABLE_ALIGNMENT.CENTER
     t2.style = "Table Grid"
     _disable_autofit(t2)
-    # PO DATE | PO NUMBER | REQUISITIONER | LEAD TIME | SHIPPED VIA | F.O.B. POINT | TERMS
-    t2_widths = [Cm(2.2), Cm(2.4), Cm(3.0), Cm(2.3), Cm(2.4), Cm(2.5), Cm(2.5)]
+    # PO DATE | PO NUMBER | REQUISITIONER | LEAD TIME | SHIPPED VIA | FREIGHT TERMS | TERMS
+    t2_widths = [Cm(2.2), Cm(2.7), Cm(3.0), Cm(2.3), Cm(2.4), Cm(2.5), Cm(2.5)]  # sums to 17.6cm
     for i, w in enumerate(t2_widths):
         t2.columns[i].width = w
 
     meta_labels = ["P.O. DATE", "P.O. NUMBER", "REQUISITIONER", "LEAD TIME",
-                   "SHIPPED VIA", "F.O.B. POINT", "TERMS"]
+                   "SHIPPED VIA", "FREIGHT TERMS", "TERMS"]
     meta_values = [po_date, po_number, requisitioner, lead_time,
                    shipped_via, fob_point, terms]
 
@@ -659,7 +675,8 @@ def generate_po_docx(
         row.cells[i].width = t2_widths[i]
         p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run(h); run.bold = True; run.font.size = Pt(7); run.font.small_caps = True
-        _add_shading(row.cells[i], "D9E2F3")
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        _add_shading(row.cells[i], BRAND_TEAL)
 
     # Value row
     row = t2.add_row()
@@ -681,13 +698,13 @@ def generate_po_docx(
     t3.alignment = WD_TABLE_ALIGNMENT.CENTER
     t3.style = "Table Grid"
     _disable_autofit(t3)
-    col_widths = [Cm(0.9), Cm(3.5), Cm(3.0), Cm(1.2), Cm(1.9), Cm(1.9), Cm(2.3), Cm(2.6)]
+    col_widths = [Cm(1.2), Cm(3.5), Cm(3.0), Cm(1.2), Cm(1.9), Cm(1.9), Cm(2.3), Cm(2.6)]  # sums to 17.6cm
     for i, w in enumerate(col_widths):
         t3.columns[i].width = w
 
     # Header row
     line_headers = [
-        "ITEM #", "DESCRIPTION", "UNIT SIZE", "QTY",
+        "ITEM\n#", "DESCRIPTION", "UNIT SIZE", "QTY",
         f"AREA EACH ({unit_label})", f"TOTAL ({unit_label})",
         "UNIT PRICE", "TOTAL",
     ]
@@ -697,7 +714,7 @@ def generate_po_docx(
         p = row.cells[i].paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run(h); run.bold = True; run.font.size = Pt(8); run.font.small_caps = True
         run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        _add_shading(row.cells[i], "2E75B6")
+        _add_shading(row.cells[i], BRAND_TEAL)
 
     # Line items
     align_map = {
@@ -795,7 +812,7 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
 
     Newly-supported optional fields (Fix #2):
       payment_term_id — int, account.payment.term ID. Maps from the Terms dropdown.
-      incoterm_id     — int, account.incoterms ID. Maps from the F.O.B. dropdown.
+      incoterm_id     — int, account.incoterms ID. Maps from the Freight Terms dropdown.
       date_planned    — datetime.date or datetime.datetime. Maps from the Lead Time date picker.
 
     The 'requisitioner' free-text field is fuzzy-matched against active internal
@@ -1046,15 +1063,15 @@ if line_items and po_type_key == "Glass":
         lead_time = lead_date.strftime("%m/%d/%Y")  # human-readable for the .docx
         shipped_via = st.selectbox("Shipped Via", ["Air", "Ground"], index=1)
     with dcol2:
-        # F.O.B. → dropdown of all 11 Odoo incoterms
+        # Freight Terms → dropdown of all 11 Odoo incoterms
         incoterm_map, incoterm_err = fetch_incoterms()
         if incoterm_err:
             st.warning(f"Could not load incoterms: {incoterm_err}")
-        # Default to DDP (matches old hardcoded default)
+        # Default to DAP (per Anas, Nov 2026; was DDP)
         incoterm_keys = list(incoterm_map.keys()) if incoterm_map else []
-        ddp_idx = next((i for i, k in enumerate(incoterm_keys) if k.startswith("DDP")), 0)
-        fob_label = st.selectbox("F.O.B. Point", incoterm_keys,
-                                  index=ddp_idx if incoterm_keys else None,
+        dap_idx = next((i for i, k in enumerate(incoterm_keys) if k.startswith("DAP")), 0)
+        fob_label = st.selectbox("Freight Terms", incoterm_keys,
+                                  index=dap_idx if incoterm_keys else None,
                                   help="Becomes 'incoterm_id' on the Odoo PO.")
         fob_point = fob_label.split(" — ")[0] if fob_label else ""  # short code for .docx
 
@@ -1200,15 +1217,14 @@ elif line_items and po_type_key == "Aluminium":
                                      help="Becomes 'date_planned' on the Odoo PO.")
         lead_time_al = lead_date_al.strftime("%m/%d/%Y")
         shipped_via = st.selectbox("Shipped Via", ["Air", "Ground"], index=1, key="al_ship")
-        # F.O.B. dropdown
+        # Freight Terms dropdown
         incoterm_map, incoterm_err = fetch_incoterms()
         if incoterm_err:
             st.warning(f"Could not load incoterms: {incoterm_err}")
         incoterm_keys = list(incoterm_map.keys()) if incoterm_map else []
-        # Aluminium previously defaulted to "Shipping Point" (not a real incoterm).
-        # Use FOB as the closest official equivalent.
-        fob_idx = next((i for i, k in enumerate(incoterm_keys) if k.startswith("FOB")), 0)
-        fob_label = st.selectbox("F.O.B. Point", incoterm_keys,
+        # Default to DAP, same as glass (per Anas, Nov 2026; was FOB)
+        fob_idx = next((i for i, k in enumerate(incoterm_keys) if k.startswith("DAP")), 0)
+        fob_label = st.selectbox("Freight Terms", incoterm_keys,
                                   index=fob_idx if incoterm_keys else None,
                                   key="al_fob",
                                   help="Becomes 'incoterm_id' on the Odoo PO.")
