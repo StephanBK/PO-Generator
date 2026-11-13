@@ -219,9 +219,16 @@ def parse_glass_file(file_bytes):
         # Drop totals row
         df = df[df["Tag"].astype(str).str.strip() != "Totals"].copy()
         df = df.dropna(subset=["Tag"])
+        # Glass type (GL-1, GL-2, ...) is in newer cutlist files only.
+        # Older files have no such column, so glass_type stays "".
+        gt_col = next((c for c in df.columns
+                       if str(c).strip().lower() == "glass type"), None)
         lines = []
         for _, row in df.iterrows():
             try:
+                glass_type = ""
+                if gt_col is not None and pd.notna(row.get(gt_col)):
+                    glass_type = str(row.get(gt_col)).strip()
                 area_each  = float(row.get("Area Each (ft²)", 0) or 0)
                 qty        = int(float(row.get("Qty", 0) or 0))
                 area_total = float(row.get("Area Total (ft²)", 0) or 0)
@@ -231,6 +238,7 @@ def parse_glass_file(file_bytes):
                 if qty > 0:
                     lines.append({
                         "tag":        str(row.get("Tag", "")),
+                        "glass_type": glass_type,
                         "size_str":   size_str,
                         "area_each":  round(area_each, 2),
                         "qty":        qty,
@@ -1019,19 +1027,68 @@ if line_items and po_type_key == "Glass":
     total_area = sum(l["area_total"] for l in line_items)
     st.write(f"**{total_qty} pieces | {total_area:.2f} ft² total**")
 
-    st.write("Enter description for each glass size:")
-    first_desc = st.text_input("Description for all lines (default)",
-                               placeholder="e.g. GT1 – 10mm Leadus VIG: 5Tlow-E+V+5T",
-                               key="glass_desc_default")
-    for line in line_items:
-        line["description"] = first_desc
+    # ── Descriptions ──
+    # Newer cutlist files carry a "Glass Type" per line (GL-1, GL-2, ...).
+    # Then we ask for ONE description per glass type, and every line of
+    # that type gets it (e.g. GL-2 and GL-3 with different low-e surfaces).
+    # Older files have no type: fall back to one default description
+    # plus optional per-line overrides.
+    glass_types = []
+    for l in line_items:
+        gt = l.get("glass_type", "")
+        if gt and gt not in glass_types:
+            glass_types.append(gt)
 
-    preview = pd.DataFrame([{
-        "Tag": l["tag"], "Size": l["size_str"],
-        "Area Each (ft²)": l["area_each"], "Qty": l["qty"],
-        "Area Total (ft²)": l["area_total"],
-    } for l in line_items])
-    st.dataframe(preview, use_container_width=True, hide_index=True)
+    if glass_types:
+        st.write(f"Enter one description per glass type "
+                 f"({len(glass_types)} type{'s' if len(glass_types) != 1 else ''} in this file):")
+        type_desc = {}
+        for gt in glass_types:
+            gt_lines = [l for l in line_items if l.get("glass_type") == gt]
+            tags = [l["tag"] for l in gt_lines]
+            tag_txt = ", ".join(tags[:8]) + (f" +{len(tags) - 8} more" if len(tags) > 8 else "")
+            pcs = sum(l["qty"] for l in gt_lines)
+            type_desc[gt] = st.text_input(
+                f"{gt}: {len(gt_lines)} line{'s' if len(gt_lines) != 1 else ''}, {pcs} pcs ({tag_txt})",
+                placeholder=f"e.g. {gt}: 1\" IGU, 6mm low-E #2 + 12mm AS + 6mm clear",
+                key=f"glass_desc_type_{gt}")
+        untyped = [l for l in line_items if not l.get("glass_type")]
+        if untyped:
+            st.warning(f"{len(untyped)} line(s) have no Glass Type in the cutlist file: "
+                       + ", ".join(l["tag"] for l in untyped))
+            type_desc[""] = st.text_input("Description for lines with no glass type",
+                                          key="glass_desc_type__none")
+        for line in line_items:
+            line["description"] = type_desc.get(line.get("glass_type", ""), "").strip()
+        missing = [gt or "no type" for gt, d in type_desc.items() if not d.strip()]
+        if missing:
+            st.warning("No description yet for: " + ", ".join(missing))
+    else:
+        st.info("This file has no Glass Type column (made with an older SWR Cutlist). "
+                "Enter one default description, and change single lines below if needed. "
+                "Re-run the SWR Cutlist to get one box per glass type.")
+        first_desc = st.text_input("Description for all lines (default)",
+                                   placeholder="e.g. GT1 – 10mm Leadus VIG: 5Tlow-E+V+5T",
+                                   key="glass_desc_default")
+        with st.expander("Change the description for single lines", expanded=False):
+            for i, line in enumerate(line_items):
+                override = st.text_input(f"{line['tag']}  {line['size_str']}",
+                                         placeholder=first_desc or "Same as default",
+                                         key=f"glass_desc_line_{i}")
+                line["description"] = override.strip() or first_desc
+
+    preview_rows = []
+    for l in line_items:
+        row = {"Tag": l["tag"]}
+        if glass_types:
+            row["Glass Type"] = l.get("glass_type", "")
+        row.update({
+            "Description": l["description"], "Size": l["size_str"],
+            "Area Each (ft²)": l["area_each"], "Qty": l["qty"],
+            "Area Total (ft²)": l["area_total"],
+        })
+        preview_rows.append(row)
+    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("Step 3 — Vendor & PO Details")
