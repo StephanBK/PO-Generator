@@ -16,6 +16,8 @@ $1,000 of glass became $2,000 of project cost (bill + manufacturing order).
 `line_ids_to_clear` finds the lines where the tag must be removed.
 """
 
+import re
+
 # Products that the PO Generator used for every line before Nov 2026.
 # They stay as a fallback until the real products are in Odoo.
 GENERIC_PRODUCT_NAMES = {
@@ -55,14 +57,21 @@ def match_candidates(products, code):
     if not want:
         return []
     coded = [p for p in products if str(p.get("default_code") or "").strip()]
-    for test in (
-        lambda c: c == want,
-        lambda c: c.startswith(want),
-        lambda c: want in c,
-    ):
-        hits = [p for p in coded if test(str(p["default_code"]).strip().lower())]
-        if hits:
-            return hits
+    # The cut list writes a profile as "SWR-IG-03003". Odoo codes hold only
+    # the number ("03003-MF"). So try the full text first, then the number.
+    wants = [want]
+    numbers = re.findall(r"\d{4,}", want)
+    if numbers and numbers[-1] != want:
+        wants.append(numbers[-1])
+    for w in wants:
+        for test in (
+            lambda c: c == w,
+            lambda c: c.startswith(w),
+            lambda c: w in c,
+        ):
+            hits = [p for p in coded if test(str(p["default_code"]).strip().lower())]
+            if hits:
+                return hits
     return []
 
 

@@ -62,3 +62,9 @@ def test_rule_3_clears_stock_lines_and_keeps_service_lines():
     ]
     storable = {901: True, 920: False, 911: True}
     assert rules.line_ids_to_clear(odoo_lines, storable) == [1]
+
+
+def test_cut_list_prefix_is_ignored_when_the_number_fits():
+    products = [{"id": 1, "default_code": "03210-CA"}, {"id": 2, "default_code": "03111-MF"}]
+    assert rules.match_product(products, "SWR-IG-03210")["id"] == 1
+    assert rules.match_candidates(products, "SWR-IG-03003") == []      # no such number in Odoo

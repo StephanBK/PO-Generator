@@ -1322,7 +1322,8 @@ if line_items and po_type_key == "Glass":
 
     subtotal    = sum(l["area_total"] for l in line_items) * price_per_unit
     grand_total = subtotal + sales_tax + packaging_cost + shipping_cost + other_cost
-    st.write(f"**Subtotal: ${subtotal:,.2f}  |  Grand Total: ${grand_total:,.2f}**")
+    # "\\$" stops Streamlit from reading two dollar signs as a math formula.
+    st.write(f"**Subtotal: \\${subtotal:,.2f}  |  Grand Total: \\${grand_total:,.2f}**")
 
     st.divider()
     st.subheader("Step 4 — Generate PO")
