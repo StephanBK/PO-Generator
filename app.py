@@ -11,6 +11,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 
+import odoo_rules as rules
+
 # ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
@@ -200,6 +202,50 @@ def fetch_users():
         return user_map, None
     except Exception as e:
         return {}, str(e)
+
+@st.cache_data(ttl=120, show_spinner="Loading products from Odoo...")
+def fetch_products(po_type_key):
+    """Purchasable Odoo products for this PO type, plus the generic fallback.
+
+    Returns (products, error). Each product is a dict with:
+    id, name, default_code, uom_name, is_storable, generic, label.
+    The generic product (SWR Glass Panel / SWR Aluminium Extrusion) is the
+    fallback until the real products are in Odoo.
+    """
+    try:
+        uid, models = get_odoo_connection()
+        categ_word = "Glass" if po_type_key == "Glass" else "Aluminum Profiles"
+        generic_name = rules.GENERIC_PRODUCT_NAMES[po_type_key]
+        rows = odoo_call(models, uid, "product.product", "search_read",
+            [["|", ("name", "ilike", generic_name),
+              "&", ("purchase_ok", "=", True),
+                   ("categ_id.complete_name", "ilike", categ_word)]],
+            {"fields": ["id", "name", "default_code", "uom_id", "is_storable"],
+             "order": "default_code asc, name asc", "limit": 500})
+        products = []
+        for r in rows:
+            prod = {
+                "id": r["id"],
+                "name": r.get("name") or "",
+                "default_code": r.get("default_code") or "",
+                "uom_name": r["uom_id"][1] if r.get("uom_id") else "",
+                "is_storable": bool(r.get("is_storable")),
+            }
+            prod["generic"] = rules.is_generic(prod, po_type_key)
+            code = f"[{prod['default_code']}] " if prod["default_code"] else ""
+            tail = "  (generic, not real stock)" if prod["generic"] else f"  ({prod['uom_name']})"
+            prod["label"] = f"{code}{prod['name']}{tail}"
+            products.append(prod)
+        # Two products can have the same name and code: make each label unique.
+        seen = {}
+        for prod in products:
+            n = seen.get(prod["label"], 0)
+            seen[prod["label"]] = n + 1
+            if n:
+                prod["label"] = f"{prod['label']}  #{prod['id']}"
+        return products, None
+    except Exception as e:
+        return [], str(e)
 
 # ─────────────────────────────────────────────────────────────
 # FILE PARSERS
@@ -815,48 +861,58 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
                     po_number, requisitioner, subtotal, grand_total, po_buf,
                     po_type, po_date_str,
                     payment_term_id=None, incoterm_id=None,
-                    date_planned=None):
+                    date_planned=None, project_id=None, products=None):
     """Create a draft purchase.order in Odoo.
 
-    Newly-supported optional fields (Fix #2):
-      payment_term_id — int, account.payment.term ID. Maps from the Terms dropdown.
-      incoterm_id     — int, account.incoterms ID. Maps from the Freight Terms dropdown.
-      date_planned    — datetime.date or datetime.datetime. Maps from the Lead Time date picker.
+    Optional fields:
+      payment_term_id  int, account.payment.term ID. From the Terms dropdown.
+      incoterm_id      int, account.incoterms ID. From the Freight Terms dropdown.
+      date_planned     datetime.date or datetime.datetime. From the date picker.
+      project_id       int, project.project ID. Links the order to the project.
+      products         list from fetch_products(). Each line in po_lines can
+                       carry "product_id"; a line with none uses the generic
+                       product.
 
-    The 'requisitioner' free-text field is fuzzy-matched against active internal
-    users; if a match is found, user_id is set on the PO. Otherwise it remains
-    free text in the .docx and chatter message only (preserves prior behavior).
+    Odoo Workflow rule 3 (see odoo_rules.py): when the order has a project,
+    Odoo puts the project tag on every line. This function removes the tag
+    from lines for stock parts, because their cost must reach the project
+    only through the manufacturing order.
+
+    The 'requisitioner' free text is matched against active internal users;
+    when a match is found, user_id is set on the PO.
+
+    Returns (po_id, po_name, info). info has project_linked, tags_cleared,
+    generic_lines.
     """
     uid, models = get_odoo_connection()
 
     def oc(model, method, args, kwargs={}):
         return odoo_call(models, uid, model, method, args, kwargs)
 
-    # Find product — fail loudly if not found rather than silently
-    # falling back to a random product (which would create a PO with
-    # the wrong product on every line and the user would never know).
-    product_name = "SWR Glass Panel" if po_type == "Glass" else "SWR Aluminium Extrusion"
-    product_ids = oc("product.product", "search", [[("name", "ilike", product_name)]])
-    if not product_ids:
-        raise Exception(
-            f"Product '{product_name}' not found in Odoo. "
-            f"Please create a product with that exact name (or one that contains it) "
-            f"before creating {po_type} POs."
-        )
+    products = products or []
+    products_by_id = {p["id"]: p for p in products}
+    generic = next((p for p in products if p.get("generic")), None)
+    fallback_id = generic["id"] if generic else None
 
-    product_id = product_ids[0]
-    order_lines = []
-    for line in po_lines:
-        desc = (f"{line.get('description', '')}\n"
-                f"{line.get('size_str', line.get('length_in', ''))}\n"
-                f"Area/Length: {line['area_total']:.3f}  |  Qty: {line['qty']}")
-        line_total = line["area_total"] * price_per_unit
-        order_lines.append((0, 0, {
-            "product_id":  product_id,
-            "name":        desc,
-            "product_qty": line["qty"],
-            "price_unit":  line_total / line["qty"] if line["qty"] > 0 else 0.0,
-        }))
+    # A line with no product needs the generic product. Fail loudly when it
+    # is not in Odoo, rather than put a random product on the line.
+    if any(not l.get("product_id") for l in po_lines) and not fallback_id:
+        product_name = rules.GENERIC_PRODUCT_NAMES[po_type]
+        product_ids = oc("product.product", "search", [[("name", "ilike", product_name)]])
+        if not product_ids:
+            raise Exception(
+                f"One or more lines have no Odoo product, and the generic "
+                f"product '{product_name}' is not in Odoo. "
+                f"Select a real product for each line in Step 2."
+            )
+        fallback_id = product_ids[0]
+
+    order_lines = rules.build_order_lines(
+        po_type, po_lines, price_per_unit, products_by_id, fallback_id)
+    if not order_lines:
+        raise Exception("No line has a quantity above 0. Nothing to order.")
+    generic_ids = {fallback_id} | {p["id"] for p in products if p.get("generic")}
+    generic_lines = sum(1 for _, _, v in order_lines if v["product_id"] in generic_ids)
 
     # Build the PO payload, only including optional fields when provided
     po_vals = {
@@ -864,6 +920,8 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
         "origin":      f"{project_number} / {po_type} PO",
         "order_line":  order_lines,
     }
+    if project_id:
+        po_vals["project_id"] = int(project_id)
     if payment_term_id:
         po_vals["payment_term_id"] = payment_term_id
     if incoterm_id:
@@ -884,8 +942,26 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
             po_vals["user_id"] = matched_uid
 
     po_id = oc("purchase.order", "create", [po_vals])
-    po_data = oc("purchase.order", "read", [po_id], {"fields": ["name"]})
+    if isinstance(po_id, (list, tuple)):
+        po_id = po_id[0]
+    po_data = oc("purchase.order", "read", [[po_id]], {"fields": ["name"]})
     po_name = po_data[0]["name"] if po_data else f"ID {po_id}"
+
+    # Rule 3: remove the project tag from stock lines.
+    tags_cleared = 0
+    if project_id:
+        odoo_lines = oc("purchase.order.line", "search_read",
+                        [[("order_id", "=", po_id)]],
+                        {"fields": ["id", "product_id", "analytic_distribution"]})
+        line_product_ids = sorted({l["product_id"][0] for l in odoo_lines if l.get("product_id")})
+        storable = {}
+        if line_product_ids:
+            for p in oc("product.product", "read", [line_product_ids], {"fields": ["is_storable"]}):
+                storable[p["id"]] = bool(p.get("is_storable"))
+        to_clear = rules.line_ids_to_clear(odoo_lines, storable)
+        if to_clear:
+            oc("purchase.order.line", "write", [to_clear, {"analytic_distribution": False}])
+            tags_cleared = len(to_clear)
 
     # Attach docx
     oc("ir.attachment", "create", [{
@@ -898,10 +974,15 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
     }])
 
     # Chatter message
+    project_note = (f"Odoo project: linked. Project tag removed from {tags_cleared} stock line(s) (rule 3)."
+                    if project_id else "Odoo project: NOT linked (no project selected).")
+    generic_note = (f"<br/>Generic product on {generic_lines} line(s): the receipt will not add to real stock."
+                    if generic_lines else "")
     oc("purchase.order", "message_post", [[po_id]], {
         "body": (
             f"<b>📝 PO from INOVUES PO Generator</b><br/>"
             f"Project: {project_name}<br/>"
+            f"{project_note}{generic_note}<br/>"
             f"PO Number: {po_number}<br/>"
             f"Requisitioner: {requisitioner}<br/>"
             f"Type: {po_type}<br/>"
@@ -912,7 +993,75 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
         "message_type": "comment",
         "subtype_xmlid": "mail.mt_comment",
     })
-    return po_id, po_name
+    info = {"project_linked": bool(project_id), "tags_cleared": tags_cleared,
+            "generic_lines": generic_lines}
+    return po_id, po_name, info
+
+
+def show_odoo_result(po_id, po_name, info):
+    """Tell the person what Odoo now holds for the new draft order."""
+    st.success(f"✅ Draft PO **{po_name}** created in Odoo!")
+    st.info(f"🔗 {ODOO_URL}/web#id={po_id}&model=purchase.order&view_type=form")
+    if info["project_linked"]:
+        st.caption(f"Linked to the Odoo project. Project tag removed from "
+                   f"{info['tags_cleared']} stock line(s), so the material cost "
+                   f"reaches the project one time, at the manufacturing order.")
+    else:
+        st.warning("This order is NOT linked to an Odoo project. "
+                   "Select the project in Step 1 for a job order.")
+    if info["generic_lines"]:
+        st.warning(f"{info['generic_lines']} line(s) use the generic product. "
+                   f"The receipt will not add to real stock.")
+
+
+def pick_products_ui(po_type_key, groups, candidates_for, key_prefix):
+    """One Odoo product dropdown per group. Returns ({group: product or None}, products).
+
+    groups          list of (group key, title for the dropdown)
+    candidates_for  function(group key, real products) -> list of products that
+                    fit this group. Exactly 1 = selected for the person.
+                    2 or more = shown first, and the person must pick.
+
+    The app never puts a guessed product on a line. With no clear fit it
+    selects the generic product when Odoo has one, else it selects nothing
+    and the order cannot be created until a person picks.
+    """
+    products, prod_err = fetch_products(po_type_key)
+    if prod_err:
+        st.warning(f"Could not load Odoo products: {prod_err}. "
+                   f"The generic product will be used.")
+    if not products:
+        return {}, products
+    by_label = {p["label"]: p for p in products}
+    generic = next((p for p in products if p.get("generic")), None)
+    real = [p for p in products if not p.get("generic")]
+    chosen = {}
+    for gkey, title in groups:
+        fits = candidates_for(gkey, real) or []
+        fit_ids = {p["id"] for p in fits}
+        ordered = fits + [p for p in products if p["id"] not in fit_ids]
+        labels = [p["label"] for p in ordered]
+        default = fits[0] if len(fits) == 1 else generic
+        if len(fits) > 1:
+            default = None          # several finishes fit: a person must pick
+        pick = st.selectbox(
+            title, labels,
+            index=labels.index(default["label"]) if default else None,
+            placeholder=(f"Choose 1 of {len(fits)} that fit..." if len(fits) > 1
+                         else "Choose a product..."),
+            key=f"{key_prefix}_{gkey or 'none'}")
+        chosen[gkey] = by_label[pick] if pick else None
+    missing = [title for gkey, title in groups if chosen.get(gkey) is None]
+    if missing:
+        st.warning("No Odoo product selected for: " + ", ".join(missing)
+                   + (". The generic product will be used." if generic else
+                      ". Select one, or the order cannot be created in Odoo."))
+    if any(p and p.get("generic") for p in chosen.values()):
+        st.warning("The generic product is selected for one or more lines. "
+                   "Odoo cannot add these lines to real stock. "
+                   "Select the real product when it is in Odoo.")
+    return chosen, products
+
 
 # ─────────────────────────────────────────────────────────────
 # UI
@@ -1077,6 +1226,20 @@ if line_items and po_type_key == "Glass":
                                          key=f"glass_desc_line_{i}")
                 line["description"] = override.strip() or first_desc
 
+    # ── Odoo product per glass type (Odoo Workflow, Nov 2026) ──
+    st.write("**Odoo product.** A real product lets the receipt add to the correct stock.")
+    if glass_types:
+        glass_groups = [(gt, f"Odoo product for {gt}") for gt in glass_types]
+        if any(not l.get("glass_type") for l in line_items):
+            glass_groups.append(("", "Odoo product for lines with no glass type"))
+    else:
+        glass_groups = [("", "Odoo product for all lines")]
+    glass_chosen, glass_products = pick_products_ui(
+        "Glass", glass_groups, lambda gkey, products: [], "glass_prod")
+    for line in line_items:
+        gkey = line.get("glass_type", "") if glass_types else ""
+        line["product_id"] = (glass_chosen.get(gkey) or {}).get("id")
+
     preview_rows = []
     for l in line_items:
         row = {"Tag": l["tag"]}
@@ -1198,7 +1361,7 @@ if line_items and po_type_key == "Glass":
                 with st.spinner("Creating PO in Odoo..."):
                     try:
                         v = vendor_map[selected_vendor]
-                        po_id, po_name = create_odoo_po(
+                        po_id, po_name, po_info = create_odoo_po(
                             vendor=v, po_lines=line_items, price_per_unit=price_per_unit,
                             project_number=project_number, project_name=selected_project or "",
                             po_number=project_number, requisitioner=requisitioner,
@@ -1208,9 +1371,10 @@ if line_items and po_type_key == "Glass":
                             payment_term_id=payterm_map.get(terms) if terms else None,
                             incoterm_id=incoterm_map.get(fob_label) if fob_label else None,
                             date_planned=lead_date,
+                            project_id=project_map.get(selected_project) if selected_project else None,
+                            products=glass_products,
                         )
-                        st.success(f"✅ Draft PO **{po_name}** created in Odoo!")
-                        st.info(f"🔗 {ODOO_URL}/web#id={po_id}&model=purchase.order&view_type=form")
+                        show_odoo_result(po_id, po_name, po_info)
                     except Exception as e:
                         st.error(f"❌ Error: {str(e)}")
 
@@ -1240,6 +1404,17 @@ elif line_items and po_type_key == "Aluminium":
         line["qty"]        = c5.number_input("", value=int(line["qty"]), min_value=0, step=1, key=f"al_qty_{i}", label_visibility="collapsed")
         line["lead_time"]  = c6.text_input("", value=line.get("lead_time", "3-4 weeks"), key=f"al_lead_{i}", label_visibility="collapsed")
         line["unit_price"] = c7.number_input("", value=float(line.get("unit_price", 0.0)), min_value=0.0, step=0.01, format="%.2f", key=f"al_price_{i}", label_visibility="collapsed")
+
+    # ── Odoo product per line (Odoo Workflow, Nov 2026) ──
+    st.write("**Odoo product for each line.** The app proposes the product whose code fits the profile number.")
+    al_groups = [(str(i), f"{l['profile']}  {l['length_in']}\"") for i, l in enumerate(line_items)]
+    al_chosen, al_products = pick_products_ui(
+        "Aluminium", al_groups,
+        lambda gkey, products: rules.match_candidates(
+            products, line_items[int(gkey)]["profile"]),
+        "al_prod")
+    for i, line in enumerate(line_items):
+        line["product_id"] = (al_chosen.get(str(i)) or {}).get("id")
 
     total_pcs = sum(l["qty"] for l in line_items)
     subtotal_al = sum(l["unit_price"] * l["qty"] for l in line_items)
@@ -1343,15 +1518,10 @@ elif line_items and po_type_key == "Aluminium":
                 with st.spinner("Creating PO in Odoo..."):
                     try:
                         v = vendor_map[selected_vendor]
-                        # Map al_lines to the format create_odoo_po expects
-                        odoo_lines = [{
-                            "description": f"{l['profile']} — {l['length_in']}\" extrusion",
-                            "size_str":    f"{l['length_in']}\"",
-                            "area_total":  float(l["qty"]),
-                            "qty":         l["qty"],
-                        } for l in line_items]
-                        po_id, po_name = create_odoo_po(
-                            vendor=v, po_lines=odoo_lines, price_per_unit=1.0,
+                        # Each line goes to Odoo with its own product, quantity and
+                        # unit price (before Nov 2026 every line was sent at $1.00).
+                        po_id, po_name, po_info = create_odoo_po(
+                            vendor=v, po_lines=line_items, price_per_unit=None,
                             project_number=project_number, project_name=selected_project or "",
                             po_number=project_number, requisitioner=requisitioner,
                             subtotal=subtotal_al, grand_total=grand_total_al,
@@ -1360,9 +1530,10 @@ elif line_items and po_type_key == "Aluminium":
                             payment_term_id=payterm_map.get(terms) if terms else None,
                             incoterm_id=incoterm_map.get(fob_label) if fob_label else None,
                             date_planned=lead_date_al,
+                            project_id=project_map.get(selected_project) if selected_project else None,
+                            products=al_products,
                         )
-                        st.success(f"✅ Draft PO **{po_name}** created in Odoo!")
-                        st.info(f"🔗 {ODOO_URL}/web#id={po_id}&model=purchase.order&view_type=form")
+                        show_odoo_result(po_id, po_name, po_info)
                     except Exception as e:
                         st.error(f"❌ Error: {str(e)}")
 
