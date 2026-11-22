@@ -1,12 +1,15 @@
-"""A small fake Odoo for tests. It answers the XML-RPC calls that app.py makes
-and behaves like Odoo 19 in one important way: when an order is created with a
-project, every line gets the project tag (analytic distribution)."""
+"""A small fake Odoo for tests. It answers the JSON-2 calls that app.py makes
+(HTTPS POST to /json/2/<model>/<method>) and behaves like Odoo 19 in one important
+way: when an order is created with a project, every line gets the project tag
+(analytic distribution)."""
 import base64
 import io
 
 import pandas as pd
 
 PROJECT_ID = 12
+API_KEY = "test-key"
+DB = "inovues"
 ANALYTIC_ID = 11
 
 PRODUCTS = [
@@ -54,9 +57,22 @@ class FakeOdoo:
         self.created_orders = []
         self.line_writes = []
         self.lines = []
+        self.requests = []
 
-    def proxy(self, url, *a, **k):
-        return _Common(self) if url.endswith("/common") else _Object(self)
+    def post(self, url, json=None, headers=None, timeout=None):
+        """Stands in for requests.post. Checks the request like Odoo does, then answers."""
+        self.requests.append({"url": url, "headers": dict(headers or {}), "body": json})
+        if (headers or {}).get("Authorization") != f"bearer {API_KEY}" or (headers or {}).get("X-Odoo-Database") != DB:
+            return _Response(401, {"message": "Invalid apikey"})
+        model, method = url.split("/json/2/")[1].split("/")
+        body = dict(json or {})
+        names = {"search_read": ["domain"], "search": ["domain"], "read": ["ids"], "write": ["ids", "vals"],
+                 "create": ["vals_list"], "message_post": ["ids"]}[method]
+        args = [body.pop(n) for n in names if n in body]
+        if method == "create":
+            assert isinstance(args[0], list), "JSON-2 create takes vals_list, a list"
+            return _Response(200, [self.execute(model, method, [v], body) for v in args[0]])
+        return _Response(200, self.execute(model, method, args, body))
 
     def execute(self, model, method, args, kwargs):
         self.calls.append((model, method))
@@ -135,6 +151,7 @@ class FakeOdoo:
 
     def _purchase_order__message_post(self, args, kw):
         self.chatter = kw["body"]
+        self.chatter_is_html = kw.get("body_is_html")
         return 1
 
     def _purchase_order_line__search_read(self, args, kw):
@@ -149,17 +166,9 @@ class FakeOdoo:
         return True
 
 
-class _Common:
-    def __init__(self, odoo):
-        self.odoo = odoo
+class _Response:
+    def __init__(self, status_code, data):
+        self.status_code, self._data, self.text = status_code, data, str(data)
 
-    def authenticate(self, db, user, key, ctx):
-        return 7
-
-
-class _Object:
-    def __init__(self, odoo):
-        self.odoo = odoo
-
-    def execute_kw(self, db, uid, key, model, method, args, kwargs=None):
-        return self.odoo.execute(model, method, args, kwargs or {})
+    def json(self):
+        return self._data
