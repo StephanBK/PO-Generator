@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import xmlrpc.client
 import base64
 import os
 import io
@@ -12,13 +11,13 @@ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 
 import odoo_rules as rules
+import odoo_json2
 
 # ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
 ODOO_URL     = os.environ.get("ODOO_URL",     "https://inovues.odoo.com")
 ODOO_DB      = os.environ.get("ODOO_DB",      "inovues")
-ODOO_USER    = os.environ.get("ODOO_USER",    "sketterer@inovues.com")
 ODOO_API_KEY = os.environ.get("ODOO_API_KEY", "")
 
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ilogo.png")  # INOVUES logo for PO header
@@ -40,16 +39,17 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────
 # ODOO HELPERS
 # ─────────────────────────────────────────────────────────────
+# The app talks to Odoo through the JSON-2 API (see odoo_json2.py). The old XML-RPC
+# interface is removed in Odoo Online 21.1. JSON-2 has no login step: the API key goes
+# with every call and identifies the Odoo user. The two functions below keep the shape
+# they had with XML-RPC, so every call in this file stays as it was.
 def get_odoo_connection():
-    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-    uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API_KEY, {})
-    if not uid:
-        raise Exception("Odoo authentication failed — check ODOO_API_KEY.")
-    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-    return uid, models
+    if not ODOO_API_KEY:
+        raise Exception("Odoo API key is missing: set ODOO_API_KEY.")
+    return None, None
 
 def odoo_call(models, uid, model, method, args, kwargs={}):
-    return models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, model, method, args, kwargs)
+    return odoo_json2.call(ODOO_URL, ODOO_DB, ODOO_API_KEY, model, method, args, kwargs)
 
 @st.cache_data(ttl=120, show_spinner="Loading projects from Odoo...")
 def fetch_projects():

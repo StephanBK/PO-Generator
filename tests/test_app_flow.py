@@ -1,30 +1,31 @@
 """Run the real Streamlit app against the fake Odoo, click through both flows,
 and check what the app sends to Odoo."""
-import xmlrpc.client
-
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from tests.fake_odoo import FakeOdoo, PROJECT_ID
+import odoo_json2
+from tests.fake_odoo import API_KEY, DB, FakeOdoo, PROJECT_ID
+
+
+def _install(monkeypatch, fake):
+    monkeypatch.setenv("ODOO_URL", "https://odoo.test")
+    monkeypatch.setenv("ODOO_DB", DB)
+    monkeypatch.setenv("ODOO_API_KEY", API_KEY)
+    monkeypatch.setattr(odoo_json2.requests, "post", fake.post)
+    import streamlit as st
+    st.cache_data.clear()
+    return fake
 
 
 @pytest.fixture
 def odoo(monkeypatch):
-    fake = FakeOdoo()
-    monkeypatch.setattr(xmlrpc.client, "ServerProxy", fake.proxy)
-    import streamlit as st
-    st.cache_data.clear()
-    return fake
+    return _install(monkeypatch, FakeOdoo())
 
 
 @pytest.fixture
 def odoo_no_generic(monkeypatch):
     """Odoo as it is today: the product "SWR Aluminium Extrusion" does not exist."""
-    fake = FakeOdoo(hide_product_ids={910})
-    monkeypatch.setattr(xmlrpc.client, "ServerProxy", fake.proxy)
-    import streamlit as st
-    st.cache_data.clear()
-    return fake
+    return _install(monkeypatch, FakeOdoo(hide_product_ids={910}))
 
 
 def _select(at, label_start, value=None, index=None):
@@ -139,3 +140,23 @@ def test_no_product_and_no_generic_stops_with_a_clear_error(odoo_no_generic):
     assert not at.exception
     assert any("no Odoo product" in str(e.value) for e in at.error)
     assert odoo.created_orders == []                   # nothing was written to Odoo
+
+
+def test_every_call_goes_through_json2_with_the_api_key(odoo):
+    at = AppTest.from_file("app.py", default_timeout=60).run()
+    assert not at.exception
+    _select(at, "Odoo Project", "INO-035 Test Job"); at.run()
+    assert odoo.requests, "the app made no Odoo call"
+    assert all(r["url"].startswith("https://odoo.test/json/2/") for r in odoo.requests)
+    assert all(r["headers"] == {"Authorization": f"bearer {API_KEY}", "X-Odoo-Database": DB} for r in odoo.requests)
+    assert not any("xmlrpc" in r["url"] for r in odoo.requests)
+
+
+def test_a_wrong_api_key_shows_an_error_and_makes_no_order(monkeypatch):
+    fake = _install(monkeypatch, FakeOdoo())
+    monkeypatch.setenv("ODOO_API_KEY", "wrong-key")
+    at = AppTest.from_file("app.py", default_timeout=60).run()
+    assert not at.exception
+    shown = " ".join(str(e.value) for e in list(at.error) + list(at.warning))
+    assert "refused the API key (401)" in shown
+    assert fake.created_orders == []
