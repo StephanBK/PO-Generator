@@ -73,6 +73,7 @@ def test_glass_order_links_project_and_clears_stock_tags(odoo):
     # rule 3: both lines are stock parts, both tags removed
     assert odoo.line_writes == [([700, 701], {"analytic_distribution": False})]
     assert "removed from 2 stock line" in odoo.chatter
+    assert odoo.chatter_is_html is True          # else Odoo shows <b> and <br/> as text in the chatter
 
 
 def test_glass_order_with_generic_product_still_works_and_warns(odoo):

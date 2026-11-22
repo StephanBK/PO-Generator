@@ -151,6 +151,7 @@ class FakeOdoo:
 
     def _purchase_order__message_post(self, args, kw):
         self.chatter = kw["body"]
+        self.chatter_is_html = kw.get("body_is_html")
         return 1
 
     def _purchase_order_line__search_read(self, args, kw):

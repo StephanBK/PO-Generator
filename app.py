@@ -990,6 +990,8 @@ def create_odoo_po(vendor, po_lines, price_per_unit, project_number, project_nam
             f"Subtotal: ${subtotal:,.2f} | Total: ${grand_total:,.2f}<br/>"
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         ),
+        # Without this, Odoo shows the tags (<b>, <br/>) as text in the chatter.
+        "body_is_html": True,
         "message_type": "comment",
         "subtype_xmlid": "mail.mt_comment",
     })
